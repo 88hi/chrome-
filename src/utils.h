@@ -29,6 +29,7 @@ inline constexpr int IDC_SELECT_NEXT_TAB = 34016;
 inline constexpr int IDC_SELECT_PREVIOUS_TAB = 34017;
 inline constexpr int IDC_SHOW_TRANSLATE = 35009;
 inline constexpr int IDC_WINDOW_CLOSE_OTHER_TABS = 35023;
+inline constexpr int IDC_FOCUS_LOCATION = 39001;
 
 // Global constants - use functions to avoid static initialization order issues
 // Returns the path of this process's executable, empty when it can't be read.

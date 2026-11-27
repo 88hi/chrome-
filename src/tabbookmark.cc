@@ -38,23 +38,29 @@ std::optional<POINT> last_hover_move_point;
 std::optional<POINT> wheel_switch_point;
 
 constexpr UINT_PTR kClipboardNewTabTimerId = 0x636C4E54;  // 'clNT'
-constexpr UINT kClipboardNewTabPollMs = 20;
-constexpr UINT kClipboardNewTabSubmitDelayMs = 30;
-constexpr UINT kClipboardNewTabRestoreDelayMs = 25;
-constexpr int kClipboardNewTabMaxPolls = 25;
+constexpr UINT kClipboardNewTabPollMs = 10;
+constexpr UINT kClipboardNewTabSubmitDelayMs = 20;
+constexpr UINT kClipboardNewTabRevertDelayMs = 20;
+constexpr int kClipboardNewTabMaxPolls = 40;
 
 enum class ClipboardNewTabStage {
   kIdle,
-  kWaitingForNewTab,
+  kWaitingForFocus,
   kWaitingToSubmit,
-  kWaitingToRestoreTab,
+  kWaitingToRevertOmnibox,
+};
+
+enum class NewTabNavMode {
+  kNewTabClipboard,
+  kOmniboxForeground,
+  kOmniboxBackground,
 };
 
 HWND clipboard_new_tab_root = nullptr;
 ClipboardNewTabStage clipboard_new_tab_stage = ClipboardNewTabStage::kIdle;
+NewTabNavMode clipboard_new_tab_mode = NewTabNavMode::kNewTabClipboard;
 std::optional<int> clipboard_new_tab_initial_count;
 std::optional<std::wstring> clipboard_new_tab_text;
-Microsoft::WRL::ComPtr<IUIAutomationElement> clipboard_new_tab_previous_tab;
 int clipboard_new_tab_polls = 0;
 bool suppress_next_open_url_new_tab = false;
 
@@ -357,9 +363,9 @@ void CancelClipboardNewTabTimer() {
     clipboard_new_tab_root = nullptr;
   }
   clipboard_new_tab_stage = ClipboardNewTabStage::kIdle;
+  clipboard_new_tab_mode = NewTabNavMode::kNewTabClipboard;
   clipboard_new_tab_initial_count.reset();
   clipboard_new_tab_text.reset();
-  clipboard_new_tab_previous_tab.Reset();
   clipboard_new_tab_polls = 0;
 }
 
@@ -378,7 +384,7 @@ void CALLBACK ClipboardNewTabTimerProc(HWND hwnd,
     return;
   }
 
-  if (clipboard_new_tab_stage == ClipboardNewTabStage::kWaitingForNewTab) {
+  if (clipboard_new_tab_stage == ClipboardNewTabStage::kWaitingForFocus) {
     bool ready = IsOmniboxFocused();
     if (ready && clipboard_new_tab_initial_count.has_value()) {
       const auto current_count = FindTabCount(hwnd);
@@ -414,47 +420,58 @@ void CALLBACK ClipboardNewTabTimerProc(HWND hwnd,
       return;
     }
     suppress_next_open_url_new_tab = true;
-    SendKey({VK_RETURN});
-
-    if (clipboard_new_tab_previous_tab) {
-      clipboard_new_tab_stage = ClipboardNewTabStage::kWaitingToRestoreTab;
+    if (clipboard_new_tab_mode == NewTabNavMode::kOmniboxBackground) {
+      // Shift+Alt+Enter opens the omnibox URL/search in a background tab
+      // immediately to the right of the current tab with zero tab-switch
+      // flicker (repeated drags stack right-to-left next to the current tab).
+      SendKey({VK_SHIFT, VK_MENU, VK_RETURN});
+      clipboard_new_tab_stage = ClipboardNewTabStage::kWaitingToRevertOmnibox;
       if (!SetTimer(hwnd, kClipboardNewTabTimerId,
-                    kClipboardNewTabRestoreDelayMs,
+                    kClipboardNewTabRevertDelayMs,
                     ClipboardNewTabTimerProc)) {
         CancelClipboardNewTabTimer();
       }
       return;
     }
 
+    if (clipboard_new_tab_mode == NewTabNavMode::kOmniboxForeground) {
+      SendKey({VK_MENU, VK_RETURN});
+    } else {
+      SendKey({VK_RETURN});
+    }
     CancelClipboardNewTabTimer();
     return;
   }
 
-  // `kWaitingToRestoreTab`: return to the previously active tab so the new
-  // search/link loads in the background.
-  const auto previous_tab = clipboard_new_tab_previous_tab;
+  // `kWaitingToRevertOmnibox`: revert the current tab's omnibox back to its
+  // original URL and close any omnibox dropdown.
   CancelClipboardNewTabTimer();
-  if (previous_tab) {
-    SelectTab(previous_tab);
+  if (IsOmniboxFocused()) {
+    SendKey({VK_ESCAPE});
   }
 }
 
 void StartNewTabNavigation(HWND root,
                            std::optional<std::wstring> text,
-                           bool background) {
+                           NewTabNavMode mode) {
   if (!root) {
     return;
   }
 
   CancelClipboardNewTabTimer();
-  clipboard_new_tab_initial_count = FindTabCount(root);
+  clipboard_new_tab_mode = mode;
   clipboard_new_tab_text = std::move(text);
-  clipboard_new_tab_previous_tab =
-      background ? FindSelectedTab(root) : nullptr;
   clipboard_new_tab_polls = 0;
-  clipboard_new_tab_stage = ClipboardNewTabStage::kWaitingForNewTab;
+  clipboard_new_tab_stage = ClipboardNewTabStage::kWaitingForFocus;
 
-  ExecuteCommand(IDC_NEW_TAB, root);
+  if (mode == NewTabNavMode::kNewTabClipboard) {
+    clipboard_new_tab_initial_count = FindTabCount(root);
+    ExecuteCommand(IDC_NEW_TAB, root);
+  } else {
+    clipboard_new_tab_initial_count.reset();
+    ExecuteCommand(IDC_FOCUS_LOCATION, root);
+  }
+
   if (SetTimer(root, kClipboardNewTabTimerId, kClipboardNewTabPollMs,
                ClipboardNewTabTimerProc)) {
     clipboard_new_tab_root = root;
@@ -480,7 +497,7 @@ bool HandleRightClickNewTabButton(const MOUSEHOOKSTRUCT* pmouse) {
     return false;
   }
 
-  StartNewTabNavigation(root, std::nullopt, /*background=*/false);
+  StartNewTabNavigation(root, std::nullopt, NewTabNavMode::kNewTabClipboard);
   return true;
 }
 
@@ -813,5 +830,7 @@ void OpenInNewTab(HWND root, std::wstring text, bool background) {
   if (!root || text.empty()) {
     return;
   }
-  StartNewTabNavigation(root, std::move(text), background);
+  StartNewTabNavigation(root, std::move(text),
+                        background ? NewTabNavMode::kOmniboxBackground
+                                   : NewTabNavMode::kOmniboxForeground);
 }
