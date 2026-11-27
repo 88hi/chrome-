@@ -418,6 +418,7 @@ bool ParseBookmarkNode(JsonCursor& cur, BookmarkNode& node, int depth) {
 struct ParsedBookmarksRoots {
   BookmarkNode bookmark_bar;
   BookmarkNode other;
+  BookmarkNode synced;
 };
 
 bool ParseBookmarksJson(std::string_view json, ParsedBookmarksRoots& roots) {
@@ -453,6 +454,10 @@ bool ParseBookmarksJson(std::string_view json, ParsedBookmarksRoots& roots) {
             }
           } else if (root_key == "other") {
             if (!ParseBookmarkNode(cur, roots.other, 1)) {
+              return false;
+            }
+          } else if (root_key == "synced") {
+            if (!ParseBookmarkNode(cur, roots.synced, 1)) {
               return false;
             }
           } else {
@@ -540,10 +545,39 @@ std::optional<std::wstring> ParseLastUsedProfile(std::string_view json) {
   return std::nullopt;
 }
 
-bool HasBookmarksFile(const std::wstring& dir) {
-  return !dir.empty() &&
-         ::GetFileAttributesW((dir + L"\\Bookmarks").c_str()) !=
-             INVALID_FILE_ATTRIBUTES;
+struct CombinedBookmarkStamp {
+  std::optional<FileStamp> local_stamp;
+  std::optional<FileStamp> account_stamp;
+
+  bool HasAny() const {
+    return local_stamp.has_value() || account_stamp.has_value();
+  }
+  uint64_t MaxWriteTime() const {
+    const uint64_t t1 = local_stamp ? local_stamp->write_time : 0;
+    const uint64_t t2 = account_stamp ? account_stamp->write_time : 0;
+    return t1 >= t2 ? t1 : t2;
+  }
+  friend bool operator==(const CombinedBookmarkStamp&,
+                         const CombinedBookmarkStamp&) = default;
+};
+
+CombinedBookmarkStamp GetProfileBookmarkStamp(const std::wstring& profile_dir) {
+  CombinedBookmarkStamp s;
+  if (profile_dir.empty()) {
+    return s;
+  }
+  s.local_stamp = GetFileStamp(profile_dir + L"\\Bookmarks");
+  s.account_stamp = GetFileStamp(profile_dir + L"\\AccountBookmarks");
+  return s;
+}
+
+bool IsExistingDirectory(const std::wstring& path) {
+  if (path.empty()) {
+    return false;
+  }
+  const DWORD attrs = ::GetFileAttributesW(path.c_str());
+  return attrs != INVALID_FILE_ATTRIBUTES &&
+         (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
 
 std::optional<std::wstring> FindProcessSingletonUserDataDir() {
@@ -561,32 +595,39 @@ std::optional<std::wstring> FindProcessSingletonUserDataDir() {
     wchar_t title[MAX_PATH] = {};
     const int len = ::GetWindowTextW(window, title, MAX_PATH);
     if (len > 0) {
-      const DWORD attrs = ::GetFileAttributesW(title);
-      if (attrs != INVALID_FILE_ATTRIBUTES &&
-          (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
-        return std::wstring(title, static_cast<size_t>(len));
+      std::wstring candidate(title, static_cast<size_t>(len));
+      if (IsExistingDirectory(candidate)) {
+        return candidate;
       }
     }
   }
   return std::nullopt;
 }
 
-std::optional<std::wstring> GetUserDataDirectory() {
-  // 1. Chrome's own ProcessSingleton message window title (exact live path).
-  if (auto singleton_dir = FindProcessSingletonUserDataDir()) {
-    return singleton_dir;
-  }
-
-  // 2. Explicit --user-data-dir on browser command line (portable mode).
-  if (auto cmd_dir = GetSwitchValue(::GetCommandLineW(), L"--user-data-dir");
-      cmd_dir && !cmd_dir->empty()) {
-    std::wstring resolved = GetAbsolutePath(*cmd_dir);
-    if (::GetFileAttributesW(resolved.c_str()) != INVALID_FILE_ATTRIBUTES) {
-      return resolved;
+std::vector<std::wstring> CollectUserDataDirCandidates() {
+  std::vector<std::wstring> out;
+  auto add = [&](std::wstring dir) {
+    while (!dir.empty() && (dir.back() == L'\0' || dir.back() == L'\\' ||
+                            dir.back() == L'/')) {
+      dir.pop_back();
     }
+    if (!IsExistingDirectory(dir)) {
+      return;
+    }
+    for (const auto& existing : out) {
+      if (_wcsicmp(existing.c_str(), dir.c_str()) == 0) {
+        return;
+      }
+    }
+    out.push_back(std::move(dir));
+  };
+
+  // 1. Live ProcessSingleton message window title.
+  if (auto singleton_dir = FindProcessSingletonUserDataDir()) {
+    add(std::move(*singleton_dir));
   }
 
-  // 3. Ask chrome_elf.dll (standard Google Chrome).
+  // 2. chrome_elf.dll (already resolves UAC fallback if Program Files isn't writable).
   using GetUserDataDirectoryThunkFn =
       bool (*)(wchar_t*, size_t, wchar_t*, size_t, bool*);
   if (HMODULE chrome_elf = ::GetModuleHandleW(L"chrome_elf.dll")) {
@@ -596,77 +637,78 @@ std::optional<std::wstring> GetUserDataDirectory() {
       wchar_t invalid[MAX_PATH] = {};
       if (fn(dir, std::size(dir), invalid, std::size(invalid), nullptr) &&
           dir[0] != L'\0') {
-        return std::wstring(dir);
+        add(std::wstring(dir));
       }
     }
   }
 
-  // 4. Configured data_dir from chrome++.ini.
-  if (const auto& cfg_dir = config.GetUserDataDir();
-      cfg_dir && !cfg_dir->empty() &&
-      ::GetFileAttributesW(cfg_dir->c_str()) != INVALID_FILE_ATTRIBUTES) {
-    return *cfg_dir;
+  // 3. Explicit --user-data-dir on browser command line.
+  if (auto cmd_dir = GetSwitchValue(::GetCommandLineW(), L"--user-data-dir");
+      cmd_dir && !cmd_dir->empty()) {
+    add(GetAbsolutePath(*cmd_dir));
   }
 
-  // 5. Standard system locations fallback.
+  // 4. Configured data_dir from chrome++.ini.
+  if (const auto& cfg_dir = config.GetUserDataDir();
+      cfg_dir && !cfg_dir->empty()) {
+    add(*cfg_dir);
+  }
+
+  // 5. Standard Windows Chrome/Chromium/Edge locations.
   for (const wchar_t* rel : {
            L"%LOCALAPPDATA%\\Google\\Chrome\\User Data",
+           L"%LOCALAPPDATA%\\Google\\Chrome Beta\\User Data",
+           L"%LOCALAPPDATA%\\Google\\Chrome SxS\\User Data",
            L"%LOCALAPPDATA%\\Chromium\\User Data",
            L"%LOCALAPPDATA%\\Microsoft\\Edge\\User Data",
        }) {
-    std::wstring expanded = ExpandEnvironmentPath(rel);
-    while (!expanded.empty() && expanded.back() == L'\0') {
-      expanded.pop_back();
-    }
-    if (!expanded.empty() &&
-        ::GetFileAttributesW(expanded.c_str()) != INVALID_FILE_ATTRIBUTES) {
-      return expanded;
-    }
+    add(ExpandEnvironmentPath(rel));
   }
-  return std::nullopt;
+
+  return out;
 }
 
-std::optional<std::wstring> GetActiveProfileDir() {
-  const auto user_data = GetUserDataDirectory();
-  if (!user_data) {
-    return std::nullopt;
+std::optional<std::wstring> FindProfileWithBookmarksInUserData(
+    const std::wstring& user_data) {
+  // Check if user_data itself directly contains Bookmarks/AccountBookmarks.
+  if (GetProfileBookmarkStamp(user_data).HasAny()) {
+    return user_data;
   }
 
   // Try Local State's profile.last_used first.
-  const std::wstring local_state = *user_data + L"\\Local State";
+  const std::wstring local_state = user_data + L"\\Local State";
   if (const auto json = ReadFileSharedUtf8(local_state, 16 * 1024 * 1024)) {
     if (const auto last = ParseLastUsedProfile(*json)) {
-      std::wstring candidate = *user_data + L"\\" + *last;
-      if (HasBookmarksFile(candidate)) {
+      std::wstring candidate = user_data + L"\\" + *last;
+      if (GetProfileBookmarkStamp(candidate).HasAny()) {
         return candidate;
       }
     }
   }
 
   // Common profile names.
-  for (const wchar_t* name :
-       {L"Default", L"Profile 1", L"Profile 2", L"Profile 3"}) {
-    std::wstring candidate = *user_data + L"\\" + name;
-    if (HasBookmarksFile(candidate)) {
+  for (const wchar_t* name : {L"Default", L"Profile 1", L"Profile 2",
+                              L"Profile 3", L"Profile 4", L"Profile 5"}) {
+    std::wstring candidate = user_data + L"\\" + name;
+    if (GetProfileBookmarkStamp(candidate).HasAny()) {
       return candidate;
     }
   }
 
-  // Scan subdirectories for the most recently modified Bookmarks file.
+  // Scan subdirectories for the most recently modified Bookmarks/AccountBookmarks.
   WIN32_FIND_DATAW fd{};
-  HANDLE find = ::FindFirstFileW((*user_data + L"\\*").c_str(), &fd);
+  HANDLE find = ::FindFirstFileW((user_data + L"\\*").c_str(), &fd);
   std::wstring best_dir;
   uint64_t best_time = 0;
   if (find != INVALID_HANDLE_VALUE) {
     do {
       if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
           fd.cFileName[0] != L'.') {
-        std::wstring dir = *user_data + L"\\" + fd.cFileName;
-        if (auto stamp = GetFileStamp(dir + L"\\Bookmarks")) {
-          if (stamp->write_time >= best_time) {
-            best_time = stamp->write_time;
-            best_dir = std::move(dir);
-          }
+        std::wstring dir = user_data + L"\\" + fd.cFileName;
+        const auto stamp = GetProfileBookmarkStamp(dir);
+        if (stamp.HasAny() && stamp.MaxWriteTime() >= best_time) {
+          best_time = stamp.MaxWriteTime();
+          best_dir = std::move(dir);
         }
       }
     } while (::FindNextFileW(find, &fd));
@@ -675,8 +717,24 @@ std::optional<std::wstring> GetActiveProfileDir() {
   if (!best_dir.empty()) {
     return best_dir;
   }
+  return std::nullopt;
+}
 
-  return *user_data + L"\\Default";
+std::optional<std::wstring> FindBestActiveProfileDir(
+    std::wstring* tried_summary) {
+  const auto candidates = CollectUserDataDirCandidates();
+  for (const auto& ud : candidates) {
+    if (auto profile = FindProfileWithBookmarksInUserData(ud)) {
+      return profile;
+    }
+    if (tried_summary) {
+      if (!tried_summary->empty()) {
+        *tried_summary += L" | ";
+      }
+      *tried_summary += ud;
+    }
+  }
+  return std::nullopt;
 }
 
 std::shared_ptr<FaviconBitmap> DecodePngToPbgra(
@@ -737,7 +795,7 @@ struct BookmarkStore {
   std::mutex mutex;
   std::wstring profile_dir;
   std::wstring last_diag = L"尚未加载";
-  std::optional<FileStamp> bookmarks_stamp;
+  CombinedBookmarkStamp bookmarks_stamp;
   bool last_show_other = true;
   std::shared_ptr<const std::vector<BookmarkNode>> root_items =
       std::make_shared<std::vector<BookmarkNode>>();
@@ -763,18 +821,19 @@ BookmarkModel& BookmarkModel::Instance() {
 
 bool BookmarkModel::EnsureLoaded(bool show_other_bookmarks) {
   auto& store = GetStore();
-  const auto profile_dir = GetActiveProfileDir();
+  std::wstring tried;
+  const auto profile_dir = FindBestActiveProfileDir(&tried);
   if (!profile_dir) {
     std::lock_guard lock(store.mutex);
-    store.last_diag = L"未找到 Chrome User Data 目录";
+    store.last_diag =
+        tried.empty() ? L"未找到 Chrome 数据目录" : (L"未找到书签文件: " + tried);
     return false;
   }
 
-  const std::wstring bookmarks_path = *profile_dir + L"\\Bookmarks";
-  const auto stamp = GetFileStamp(bookmarks_path);
-  if (!stamp) {
+  const CombinedBookmarkStamp stamp = GetProfileBookmarkStamp(*profile_dir);
+  if (!stamp.HasAny()) {
     std::lock_guard lock(store.mutex);
-    store.last_diag = L"未找到文件: " + bookmarks_path;
+    store.last_diag = L"未找到书签文件: " + *profile_dir;
     return false;
   }
 
@@ -787,32 +846,62 @@ bool BookmarkModel::EnsureLoaded(bool show_other_bookmarks) {
     }
   }
 
-  const auto json = ReadFileSharedUtf8(bookmarks_path, 64 * 1024 * 1024);
-  if (!json) {
+  auto items = std::make_shared<std::vector<BookmarkNode>>();
+  std::vector<BookmarkNode> merged_other;
+  std::vector<BookmarkNode> merged_synced;
+  std::wstring other_title = L"其他书签";
+  bool any_parsed = false;
+
+  auto load_one_file = [&](const std::wstring& path) {
+    const auto json = ReadFileSharedUtf8(path, 64 * 1024 * 1024);
+    if (!json) {
+      return;
+    }
+    ParsedBookmarksRoots roots;
+    if (!ParseBookmarksJson(*json, roots)) {
+      return;
+    }
+    any_parsed = true;
+    for (auto& n : roots.bookmark_bar.children) {
+      items->push_back(std::move(n));
+    }
+    if (!roots.other.title.empty()) {
+      other_title = roots.other.title;
+    }
+    for (auto& n : roots.other.children) {
+      merged_other.push_back(std::move(n));
+    }
+    for (auto& n : roots.synced.children) {
+      merged_synced.push_back(std::move(n));
+    }
+  };
+
+  // Load AccountBookmarks first (Chrome 130+ signed-in account storage), then local Bookmarks.
+  if (stamp.account_stamp) {
+    load_one_file(*profile_dir + L"\\AccountBookmarks");
+  }
+  if (stamp.local_stamp) {
+    load_one_file(*profile_dir + L"\\Bookmarks");
+  }
+
+  if (!any_parsed) {
     std::lock_guard lock(store.mutex);
-    store.last_diag = L"无法读取: " + bookmarks_path;
+    store.last_diag = L"书签 JSON 解析失败: " + *profile_dir;
     return false;
   }
 
-  ParsedBookmarksRoots roots;
-  if (!ParseBookmarksJson(*json, roots)) {
-    std::lock_guard lock(store.mutex);
-    store.last_diag = L"JSON 解析失败: " + bookmarks_path;
-    return false;
-  }
-
-  auto items = std::make_shared<std::vector<BookmarkNode>>(
-      std::move(roots.bookmark_bar.children));
-  if (show_other_bookmarks && !roots.other.children.empty()) {
+  if (show_other_bookmarks && !merged_other.empty()) {
     BookmarkNode other_folder;
-    other_folder.id = std::move(roots.other.id);
-    other_folder.title =
-        roots.other.title.empty() ? L"其他书签" : std::move(roots.other.title);
+    other_folder.id = L"__other__";
+    other_folder.title = other_title;
     other_folder.is_folder = true;
-    other_folder.children = std::move(roots.other.children);
+    other_folder.children = std::move(merged_other);
     items->push_back(std::move(other_folder));
-  } else if (items->empty() && !roots.other.children.empty()) {
-    *items = std::move(roots.other.children);
+  } else if (items->empty() && !merged_other.empty()) {
+    *items = std::move(merged_other);
+  }
+  if (items->empty() && !merged_synced.empty()) {
+    *items = std::move(merged_synced);
   }
 
   std::lock_guard lock(store.mutex);
@@ -820,8 +909,8 @@ bool BookmarkModel::EnsureLoaded(bool show_other_bookmarks) {
   store.bookmarks_stamp = stamp;
   store.last_show_other = show_other_bookmarks;
   store.last_diag = items->empty()
-                        ? (L"书签栏为空 (" + bookmarks_path + L")")
-                        : (L"已加载: " + bookmarks_path);
+                        ? (L"书签栏为空: " + *profile_dir)
+                        : (L"已加载: " + *profile_dir);
   store.root_items = std::move(items);
   return true;
 }
