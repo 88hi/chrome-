@@ -1425,3 +1425,67 @@ bool IsOnNewTab(HWND hwnd, const std::vector<std::wstring>& extra_tab_names) {
 
   return false;
 }
+
+std::optional<BookmarkAnchorRect> FindBookmarkButtonAnchor(HWND hwnd,
+                                                           int anchor_mode) {
+  if (!hwnd || !IsWindow(hwnd) || IsIconic(hwnd) || !IsWindowVisible(hwnd)) {
+    return std::nullopt;
+  }
+
+  const UiaSession* session = GetUiaSession();
+  if (!session) {
+    return std::nullopt;
+  }
+
+  const auto window_element = GetElementFromWindow(*session, hwnd);
+  if (!window_element) {
+    return std::nullopt;
+  }
+
+  const auto top_container = FindShallowDescendantByClasses(
+      session->control_view_walker.Get(), window_element,
+      {L"TopContainerView"}, /*max_visited=*/256);
+  if (!top_container) {
+    return std::nullopt;
+  }
+
+  ComPtr<IUIAutomationElement> target;
+  if (anchor_mode == 0) {
+    target = FindShallowDescendantByClasses(
+        session->control_view_walker.Get(), top_container,
+        {L"LocationBarView"}, /*max_visited=*/128);
+    if (!target) {
+      target = FindShallowDescendantByClasses(
+          session->control_view_walker.Get(), top_container,
+          {L"ToolbarView"}, /*max_visited=*/64);
+    }
+  } else if (anchor_mode == 1) {
+    target = FindShallowDescendantByClasses(
+        session->control_view_walker.Get(), top_container,
+        {L"ToolbarView"}, /*max_visited=*/64);
+  } else {
+    target = FindShallowDescendantByClasses(
+        session->control_view_walker.Get(), window_element,
+        {L"HorizontalTabStripRegionViewOld", L"VerticalTabStripRegionView"},
+        /*max_visited=*/256);
+    if (!target) {
+      target = top_container;
+    }
+  }
+
+  if (!target) {
+    return std::nullopt;
+  }
+
+  RECT rect{};
+  if (FAILED(target->get_CurrentBoundingRectangle(&rect)) ||
+      IsRectEmpty(&rect)) {
+    return std::nullopt;
+  }
+
+  return BookmarkAnchorRect{rect, true};
+}
+
+bool IsChromeWindowFullscreen(HWND hwnd) {
+  return hwnd && IsWindowFullScreen(hwnd);
+}

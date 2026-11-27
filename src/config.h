@@ -12,6 +12,9 @@ class Config {
   static Config& Instance();
 
   void ReloadTabsConfig();
+  void ReloadBookmarksConfig();
+  void UpdateBookmarkPopupSize(int column_width, int max_height);
+  void UpdateBookmarkButtonOffset(int offset_x, int offset_y);
 
   // general
   const std::wstring& GetCommandLine() const { return command_line_; }
@@ -79,6 +82,58 @@ class Config {
     return disable_tab_names_;
   }
 
+  // bookmarks popup (atomic/synchronized for hot-reload)
+  bool IsBookmarksPopupEnabled() const {
+    return bookmarks_enabled_.load(std::memory_order_relaxed);
+  }
+  const std::wstring& GetBookmarksHotkey() const { return bookmarks_hotkey_; }
+  int GetBookmarksButtonAnchor() const {
+    return bookmarks_button_anchor_.load(std::memory_order_relaxed);
+  }
+  int GetBookmarksButtonOffsetX() const {
+    return bookmarks_button_offset_x_.load(std::memory_order_relaxed);
+  }
+  int GetBookmarksButtonOffsetY() const {
+    return bookmarks_button_offset_y_.load(std::memory_order_relaxed);
+  }
+  int GetBookmarksButtonSize() const {
+    return bookmarks_button_size_.load(std::memory_order_relaxed);
+  }
+  int GetBookmarksColumnWidth() const {
+    return bookmarks_column_width_.load(std::memory_order_relaxed);
+  }
+  int GetBookmarksMaxHeight() const {
+    return bookmarks_max_height_.load(std::memory_order_relaxed);
+  }
+  int GetBookmarksItemHeight() const {
+    return bookmarks_item_height_.load(std::memory_order_relaxed);
+  }
+  int GetBookmarksFontSize() const {
+    return bookmarks_font_size_.load(std::memory_order_relaxed);
+  }
+  std::wstring GetBookmarksFontFamily() const;
+  int GetBookmarksIconSize() const {
+    return bookmarks_icon_size_.load(std::memory_order_relaxed);
+  }
+  int GetBookmarksCornerRadius() const {
+    return bookmarks_corner_radius_.load(std::memory_order_relaxed);
+  }
+  int GetBookmarksTheme() const {
+    return bookmarks_theme_.load(std::memory_order_relaxed);
+  }
+  uint32_t GetBookmarksBgColor() const {
+    return bookmarks_bg_color_.load(std::memory_order_relaxed);
+  }
+  uint32_t GetBookmarksTextColor() const {
+    return bookmarks_text_color_.load(std::memory_order_relaxed);
+  }
+  uint32_t GetBookmarksHoverColor() const {
+    return bookmarks_hover_color_.load(std::memory_order_relaxed);
+  }
+  bool IsBookmarksShowOther() const {
+    return bookmarks_show_other_.load(std::memory_order_relaxed);
+  }
+
   // keymapping
   using KeyMappingPair = std::pair<std::wstring, std::wstring>;
   const auto& GetKeyMappings() const { return key_mappings_; }
@@ -129,6 +184,26 @@ class Config {
   std::atomic<bool> new_tab_disable_;
   std::atomic<int> super_drag_mode_;
   std::vector<std::wstring> disable_tab_names_;
+
+  // bookmarks popup
+  std::atomic<bool> bookmarks_enabled_{true};
+  std::wstring bookmarks_hotkey_;
+  std::atomic<int> bookmarks_button_anchor_{0};
+  std::atomic<int> bookmarks_button_offset_x_{0};
+  std::atomic<int> bookmarks_button_offset_y_{0};
+  std::atomic<int> bookmarks_button_size_{28};
+  std::atomic<int> bookmarks_column_width_{240};
+  std::atomic<int> bookmarks_max_height_{720};
+  std::atomic<int> bookmarks_item_height_{28};
+  std::atomic<int> bookmarks_font_size_{13};
+  std::wstring bookmarks_font_family_;
+  std::atomic<int> bookmarks_icon_size_{16};
+  std::atomic<int> bookmarks_corner_radius_{6};
+  std::atomic<int> bookmarks_theme_{0};
+  std::atomic<uint32_t> bookmarks_bg_color_{0xF9F9F9};
+  std::atomic<uint32_t> bookmarks_text_color_{0x202124};
+  std::atomic<uint32_t> bookmarks_hover_color_{0xE8F0FE};
+  std::atomic<bool> bookmarks_show_other_{true};
 
   // keymapping
   std::vector<KeyMappingPair> key_mappings_;

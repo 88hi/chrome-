@@ -18,6 +18,7 @@
 #include <thread>
 #include <vector>
 
+#include "bookmark_button.h"
 #include "config.h"
 #include "utils.h"
 #include "version.h"
@@ -274,6 +275,53 @@ std::string BuildConfigJson() {
   AppendJsonField(json, "ui_scale",
                   WideToUtf8(GetIniString(L"general", L"ui_scale", L"")),
                   first);
+  json += "},";
+
+  // [bookmarks]
+  json += "\"bookmarks\":{";
+  first = true;
+  AppendJsonField(json, "enabled",
+                  GetIniInt(L"bookmarks", L"enabled", 1) != 0, first);
+  AppendJsonField(json, "hotkey",
+                  WideToUtf8(GetIniString(L"bookmarks", L"hotkey", L"")),
+                  first);
+  AppendJsonField(json, "button_anchor",
+                  GetIniInt(L"bookmarks", L"button_anchor", 0), first);
+  AppendJsonField(json, "button_size",
+                  GetIniInt(L"bookmarks", L"button_size", 28), first);
+  AppendJsonField(json, "column_width",
+                  GetIniInt(L"bookmarks", L"column_width", 240), first);
+  AppendJsonField(json, "max_height",
+                  GetIniInt(L"bookmarks", L"max_height", 720), first);
+  AppendJsonField(json, "item_height",
+                  GetIniInt(L"bookmarks", L"item_height", 28), first);
+  AppendJsonField(json, "font_size",
+                  GetIniInt(L"bookmarks", L"font_size", 13), first);
+  AppendJsonField(
+      json, "font_family",
+      WideToUtf8(GetIniString(L"bookmarks", L"font_family",
+                              L"Microsoft YaHei UI")),
+      first);
+  AppendJsonField(json, "icon_size",
+                  GetIniInt(L"bookmarks", L"icon_size", 16), first);
+  AppendJsonField(json, "corner_radius",
+                  GetIniInt(L"bookmarks", L"corner_radius", 6), first);
+  AppendJsonField(json, "theme",
+                  GetIniInt(L"bookmarks", L"theme", 0), first);
+  AppendJsonField(
+      json, "bg_color",
+      WideToUtf8(GetIniString(L"bookmarks", L"bg_color", L"#F9F9F9")), first);
+  AppendJsonField(
+      json, "text_color",
+      WideToUtf8(GetIniString(L"bookmarks", L"text_color", L"#202124")),
+      first);
+  AppendJsonField(
+      json, "hover_color",
+      WideToUtf8(GetIniString(L"bookmarks", L"hover_color", L"#E8F0FE")),
+      first);
+  AppendJsonField(json, "show_other_bookmarks",
+                  GetIniInt(L"bookmarks", L"show_other_bookmarks", 1) != 0,
+                  first);
   json += "}}";
   return json;
 }
@@ -484,6 +532,24 @@ constexpr AllowedIniKey kAllowedKeys[] = {
      L"suppress_false_upgrade_notification", true, 0, 1},
     {"general.win32k", L"general", L"win32k", true, 0, 1},
     {"general.ui_scale", L"general", L"ui_scale"},
+    // bookmarks
+    {"bookmarks.enabled", L"bookmarks", L"enabled", true, 0, 1},
+    {"bookmarks.hotkey", L"bookmarks", L"hotkey"},
+    {"bookmarks.button_anchor", L"bookmarks", L"button_anchor", true, 0, 2},
+    {"bookmarks.button_size", L"bookmarks", L"button_size", true, 18, 48},
+    {"bookmarks.column_width", L"bookmarks", L"column_width", true, 150, 600},
+    {"bookmarks.max_height", L"bookmarks", L"max_height", true, 200, 2000},
+    {"bookmarks.item_height", L"bookmarks", L"item_height", true, 20, 48},
+    {"bookmarks.font_size", L"bookmarks", L"font_size", true, 10, 24},
+    {"bookmarks.font_family", L"bookmarks", L"font_family"},
+    {"bookmarks.icon_size", L"bookmarks", L"icon_size", true, 12, 28},
+    {"bookmarks.corner_radius", L"bookmarks", L"corner_radius", true, 0, 16},
+    {"bookmarks.theme", L"bookmarks", L"theme", true, 0, 3},
+    {"bookmarks.bg_color", L"bookmarks", L"bg_color"},
+    {"bookmarks.text_color", L"bookmarks", L"text_color"},
+    {"bookmarks.hover_color", L"bookmarks", L"hover_color"},
+    {"bookmarks.show_other_bookmarks", L"bookmarks", L"show_other_bookmarks",
+     true, 0, 1},
 };
 
 bool ApplyFlatConfigJson(std::string_view body) {
@@ -541,6 +607,8 @@ bool ApplyFlatConfigJson(std::string_view body) {
 
   if (any_written) {
     Config::Instance().ReloadTabsConfig();
+    Config::Instance().ReloadBookmarksConfig();
+    RefreshBookmarkButtons();
   }
   return any_written;
 }
@@ -639,6 +707,34 @@ input[type=checkbox]{width:18px;height:18px;accent-color:var(--accent);cursor:po
 )HTML") +
       std::string(R"HTML(
   <section class="card">
+    <div class="card-title">多列书签弹窗 [bookmarks] <span class="sub">保存后立即热生效（快捷键需重启）</span></div>
+    <div class="row"><div class="label"><span class="t">启用左上角收藏夹按钮与多列弹窗</span><span class="d">enabled（可按住 Alt+左键直接拖动按钮微调位置）</span></div><input type="checkbox" id="bookmarks.enabled"></div>
+    <div class="row"><div class="label"><span class="t">按钮位置锚点</span><span class="d">button_anchor</span></div><select id="bookmarks.button_anchor"><option value="0">地址栏左侧</option><option value="1">工具栏最左侧</option><option value="2">标签栏左上角</option></select></div>
+    <div class="row"><div class="label"><span class="t">触发快捷键 (hotkey)</span><span class="d">可选，例如 Alt+A（留空则仅点击按钮触发）</span></div><input type="text" id="bookmarks.hotkey" placeholder="例如 Alt+A"></div>
+    <div class="row"><div class="label"><span class="t">按钮尺寸（像素）</span><span class="d">button_size（18 - 48）</span></div><input type="number" id="bookmarks.button_size" min="18" max="48"></div>
+    <div class="row"><div class="label"><span class="t">单列宽度（像素）</span><span class="d">column_width（150 - 600，也可直接拖拽弹窗右边缘调整）</span></div><input type="number" id="bookmarks.column_width" min="150" max="600" step="10"></div>
+    <div class="row"><div class="label"><span class="t">弹窗最大高度（像素）</span><span class="d">max_height（200 - 2000，超出自动向右换列，可拖拽底边调整）</span></div><input type="number" id="bookmarks.max_height" min="200" max="2000" step="20"></div>
+    <div class="row"><div class="label"><span class="t">单行高度 / 紧凑度（像素）</span><span class="d">item_height（20 - 48）</span></div><input type="number" id="bookmarks.item_height" min="20" max="48"></div>
+    <div class="row"><div class="label"><span class="t">字体大小（像素）</span><span class="d">font_size（10 - 24）</span></div><input type="number" id="bookmarks.font_size" min="10" max="24"></div>
+    <div class="row"><div class="label"><span class="t">显示字体 (font_family)</span><span class="d">默认 Microsoft YaHei UI</span></div><input type="text" id="bookmarks.font_family"></div>
+    <div class="row"><div class="label"><span class="t">图标尺寸（像素）</span><span class="d">icon_size（12 - 28）</span></div><input type="number" id="bookmarks.icon_size" min="12" max="28"></div>
+    <div class="row"><div class="label"><span class="t">弹窗圆角（像素）</span><span class="d">corner_radius（0 - 16，0 为经典直角）</span></div><input type="number" id="bookmarks.corner_radius" min="0" max="16"></div>
+    <div class="row col">
+      <div class="label"><span class="t">弹窗主题与快速预设 (theme)</span><span class="d">选择预设或下方自定义颜色</span></div>
+      <select id="bookmarks.theme"><option value="0">跟随系统深浅色</option><option value="1">经典浅色（白底高对比）</option><option value="2">深色模式</option><option value="3">自定义配色</option></select>
+      <div class="presets">
+        <button type="button" class="preset" data-bm="classic">360 经典紧凑浅色</button>
+        <button type="button" class="preset" data-bm="modern">现代圆角自适应</button>
+        <button type="button" class="preset" data-bm="dark">暗黑高对比</button>
+      </div>
+    </div>
+    <div class="row"><div class="label"><span class="t">自定义背景色 (bg_color)</span><span class="d">theme=3 时生效，十六进制如 #F9F9F9</span></div><input type="text" id="bookmarks.bg_color"></div>
+    <div class="row"><div class="label"><span class="t">自定义文字色 (text_color)</span><span class="d">theme=3 时生效，十六进制如 #202124</span></div><input type="text" id="bookmarks.text_color"></div>
+    <div class="row"><div class="label"><span class="t">自定义悬停高亮色 (hover_color)</span><span class="d">theme=3 时生效，十六进制如 #E8F0FE</span></div><input type="text" id="bookmarks.hover_color"></div>
+    <div class="row"><div class="label"><span class="t">末尾显示「其他书签」文件夹</span><span class="d">show_other_bookmarks（默认一级页面直接显示书签栏）</span></div><input type="checkbox" id="bookmarks.show_other_bookmarks"></div>
+  </section>
+
+  <section class="card">
     <div class="card-title">常规与启动 [general] <span class="sub">修改后需重启 Chrome 生效</span></div>
     <div class="row col">
       <div class="label"><span class="t">紧凑顶栏 / 界面缩放 (ui_scale)</span><span class="d">压缩标签栏与地址栏高度（自动附加 --top-chrome-touch-ui=disabled 与 --force-device-scale-factor）。留空跟随系统 DPI；若网页变小，可在 Chrome 外观设置里将“页面缩放”调为 110%～125%</span></div>
@@ -663,7 +759,7 @@ input[type=checkbox]{width:18px;height:18px;accent-color:var(--accent);cursor:po
     <div class="row"><div class="label"><span class="t">启用 win32k 兜底 (win32k)</span><span class="d">仅在启动崩溃时开启</span></div><input type="checkbox" id="general.win32k"></div>
   </section>
 
-  <div class="notice">提示：[tabs] 标签页相关开关保存后立即生效；[proxy] 本地代理与 [general] 启动项修改后请完全关闭并重启 Chrome。</div>
+  <div class="notice">提示：[tabs] 与 [bookmarks] 样式及尺寸设置保存后立即生效；[proxy] 本地代理与 [general] 启动项修改后请完全关闭并重启 Chrome。</div>
 </main>
 <div id="toast"></div>
 <script>
@@ -681,6 +777,10 @@ const fields = [
   'tabs.keep_last_tab','tabs.wheel_tab','tabs.wheel_tab_when_press_rbutton',
   'tabs.hover_tab','tabs.hover_tab_delay','tabs.open_url_new_tab',
   'tabs.open_bookmark_new_tab','tabs.super_drag','tabs.new_tab_disable','tabs.new_tab_disable_name',
+  'bookmarks.enabled','bookmarks.button_anchor','bookmarks.hotkey','bookmarks.button_size',
+  'bookmarks.column_width','bookmarks.max_height','bookmarks.item_height','bookmarks.font_size',
+  'bookmarks.font_family','bookmarks.icon_size','bookmarks.corner_radius','bookmarks.theme',
+  'bookmarks.bg_color','bookmarks.text_color','bookmarks.hover_color','bookmarks.show_other_bookmarks',
   'proxy.enabled','proxy.server','proxy.bypass_list',
   'general.ui_scale','general.boss_key','general.translate_key','general.command_line',
   'general.data_dir','general.cache_dir','general.launch_on_startup',
@@ -724,7 +824,7 @@ async function saveConfig() {
       body: JSON.stringify(payload)
     });
     if (!res.ok) throw new Error('HTTP ' + res.status);
-    toast('已保存到 chrome++.ini（标签页设置已立即生效）');
+    toast('已保存到 chrome++.ini（标签页与书签设置已立即生效）');
   } catch (e) {
     toast('保存失败：' + e.message);
   }
@@ -738,6 +838,24 @@ document.querySelectorAll('.preset').forEach(btn => {
       $('proxy.enabled').checked = true;
     } else if (btn.dataset.scale !== undefined) {
       $('general.ui_scale').value = btn.dataset.scale;
+    } else if (btn.dataset.bm === 'classic') {
+      $('bookmarks.theme').value = '1';
+      $('bookmarks.column_width').value = '230';
+      $('bookmarks.item_height').value = '25';
+      $('bookmarks.font_size').value = '12';
+      $('bookmarks.corner_radius').value = '2';
+    } else if (btn.dataset.bm === 'modern') {
+      $('bookmarks.theme').value = '0';
+      $('bookmarks.column_width').value = '250';
+      $('bookmarks.item_height').value = '30';
+      $('bookmarks.font_size').value = '13';
+      $('bookmarks.corner_radius').value = '8';
+    } else if (btn.dataset.bm === 'dark') {
+      $('bookmarks.theme').value = '2';
+      $('bookmarks.column_width').value = '240';
+      $('bookmarks.item_height').value = '28';
+      $('bookmarks.font_size').value = '13';
+      $('bookmarks.corner_radius').value = '6';
     }
   });
 });

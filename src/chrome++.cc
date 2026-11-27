@@ -10,6 +10,7 @@
 #include "detours.h"
 
 #include "appid.h"
+#include "bookmark_button.h"
 #include "config.h"
 #include "green.h"
 #include "hijack.h"
@@ -52,6 +53,9 @@ void ChromePlus() {
 
   // Super Drag (drag text to search, drag links to open in new tab).
   SuperDrag();
+
+  // Top-left bookmark trigger button and multi-column bookmark popup.
+  BookmarkButton();
 
   // Install input hooks (must be called after all handlers are registered).
   InstallInputHooks();

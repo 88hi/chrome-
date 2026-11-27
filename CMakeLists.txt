@@ -165,8 +165,31 @@ target_compile_definitions(zstd PRIVATE
   ZSTD_EXCLUDE_BTULTRA_BLOCK_COMPRESSOR
 )
 
+add_library(sqlite3 STATIC
+  sqlite3/sqlite3.c
+)
+target_include_directories(sqlite3 PUBLIC sqlite3)
+target_compile_definitions(sqlite3 PRIVATE
+  SQLITE_THREADSAFE=0
+  SQLITE_OMIT_LOAD_EXTENSION=1
+  SQLITE_OMIT_COMPLETE=1
+  SQLITE_OMIT_DEPRECATED=1
+  SQLITE_OMIT_PROGRESS_CALLBACK=1
+  SQLITE_OMIT_SHARED_CACHE=1
+  SQLITE_OMIT_TRACE=1
+  SQLITE_OMIT_UTF16=1
+  SQLITE_DQS=0
+)
+target_compile_options(sqlite3 PRIVATE
+  $<$<COMPILE_LANG_AND_ID:C,Clang>:-Wno-everything>
+  $<$<COMPILE_LANG_AND_ID:C,MSVC>:/w>
+)
+
 add_library(chrome_plus SHARED
   src/appid.cc
+  src/bookmark_button.cc
+  src/bookmark_model.cc
+  src/bookmark_popup.cc
   src/chrome++.cc
   src/chrome++.rc
   src/config.cc
@@ -222,9 +245,14 @@ target_link_libraries(chrome_plus PRIVATE
   ole32
   ws2_32
   bcrypt
+  d2d1
+  dwrite
+  windowscodecs
+  dwmapi
   detours
   mini_gzip
   zstd
+  sqlite3
 )
 
 target_link_options(chrome_plus PRIVATE

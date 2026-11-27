@@ -31,4 +31,14 @@ bool SelectTab(const Microsoft::WRL::ComPtr<IUIAutomationElement>& tab);
 [[nodiscard]] bool IsOnNewTab(HWND hwnd,
                               const std::vector<std::wstring>& extra_tab_names);
 
+struct BookmarkAnchorRect {
+  RECT rect{};
+  bool found = false;
+};
+// anchor_mode: 0=left of address bar, 1=leftmost of toolbar, 2=top-left of tab strip.
+[[nodiscard]] std::optional<BookmarkAnchorRect> FindBookmarkButtonAnchor(
+    HWND hwnd,
+    int anchor_mode);
+[[nodiscard]] bool IsChromeWindowFullscreen(HWND hwnd);
+
 #endif  // CHROME_PLUS_SRC_UIA_H_
