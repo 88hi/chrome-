@@ -1075,7 +1075,9 @@ std::unique_ptr<PopupWindow> CreatePopupLevel(
   if (!win->items || win->items->empty()) {
     BookmarkNode empty_node;
     empty_node.id = L"__empty__";
-    empty_node.title = L"(空文件夹)";
+    empty_node.title =
+        level == 0 ? BookmarkModel::Instance().GetDiagnosticInfo()
+                   : L"(空文件夹)";
     win->empty_fallback.push_back(std::move(empty_node));
   }
 

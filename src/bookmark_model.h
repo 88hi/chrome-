@@ -43,6 +43,9 @@ class BookmarkModel {
   // needed, posting `notify_msg` to `notify_hwnd` when new icons are ready.
   void RequestFaviconsAsync(HWND notify_hwnd, UINT notify_msg);
 
+  // Returns diagnostic status when root items are empty.
+  std::wstring GetDiagnosticInfo() const;
+
  private:
   BookmarkModel() = default;
   ~BookmarkModel() = default;
