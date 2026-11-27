@@ -20,6 +20,8 @@
 #include <utility>
 #include <vector>
 
+#include "config.h"
+#include "portable.h"
 #include "sqlite3.h"
 #include "utils.h"
 
@@ -419,6 +421,9 @@ struct ParsedBookmarksRoots {
 };
 
 bool ParseBookmarksJson(std::string_view json, ParsedBookmarksRoots& roots) {
+  if (json.starts_with("\xEF\xBB\xBF")) {
+    json.remove_prefix(3);
+  }
   JsonCursor cur(json);
   if (!cur.Consume('{')) {
     return false;
@@ -478,6 +483,9 @@ bool ParseBookmarksJson(std::string_view json, ParsedBookmarksRoots& roots) {
 }
 
 std::optional<std::wstring> ParseLastUsedProfile(std::string_view json) {
+  if (json.starts_with("\xEF\xBB\xBF")) {
+    json.remove_prefix(3);
+  }
   JsonCursor cur(json);
   if (!cur.Consume('{')) {
     return std::nullopt;
@@ -532,25 +540,60 @@ std::optional<std::wstring> ParseLastUsedProfile(std::string_view json) {
   return std::nullopt;
 }
 
+bool HasBookmarksFile(const std::wstring& dir) {
+  return !dir.empty() &&
+         ::GetFileAttributesW((dir + L"\\Bookmarks").c_str()) !=
+             INVALID_FILE_ATTRIBUTES;
+}
+
 std::optional<std::wstring> GetUserDataDirectory() {
+  // 1. Explicit --user-data-dir on browser command line (portable mode).
+  if (auto cmd_dir = GetSwitchValue(::GetCommandLineW(), L"--user-data-dir");
+      cmd_dir && !cmd_dir->empty()) {
+    std::wstring resolved = GetAbsolutePath(*cmd_dir);
+    if (::GetFileAttributesW(resolved.c_str()) != INVALID_FILE_ATTRIBUTES) {
+      return resolved;
+    }
+  }
+
+  // 2. Ask chrome_elf.dll (standard Google Chrome).
   using GetUserDataDirectoryThunkFn =
       bool (*)(wchar_t*, size_t, wchar_t*, size_t, bool*);
-  HMODULE chrome_elf = ::GetModuleHandleW(L"chrome_elf.dll");
-  if (!chrome_elf) {
-    return std::nullopt;
+  if (HMODULE chrome_elf = ::GetModuleHandleW(L"chrome_elf.dll")) {
+    if (auto fn = reinterpret_cast<GetUserDataDirectoryThunkFn>(
+            ::GetProcAddress(chrome_elf, "GetUserDataDirectoryThunk"))) {
+      std::vector<wchar_t> dir(4096, L'\0');
+      std::vector<wchar_t> invalid(4096, L'\0');
+      if (fn(dir.data(), dir.size(), invalid.data(), invalid.size(), nullptr) &&
+          dir[0] != L'\0') {
+        return std::wstring(dir.data());
+      }
+    }
   }
-  auto fn = reinterpret_cast<GetUserDataDirectoryThunkFn>(
-      ::GetProcAddress(chrome_elf, "GetUserDataDirectoryThunk"));
-  if (!fn) {
-    return std::nullopt;
+
+  // 3. Configured data_dir from chrome++.ini.
+  if (const auto& cfg_dir = config.GetUserDataDir();
+      cfg_dir && !cfg_dir->empty() &&
+      ::GetFileAttributesW(cfg_dir->c_str()) != INVALID_FILE_ATTRIBUTES) {
+    return *cfg_dir;
   }
-  wchar_t dir[MAX_PATH] = {};
-  wchar_t invalid[MAX_PATH] = {};
-  if (!fn(dir, std::size(dir), invalid, std::size(invalid), nullptr) ||
-      dir[0] == L'\0') {
-    return std::nullopt;
+
+  // 4. Standard system locations fallback.
+  for (const wchar_t* rel : {
+           L"%LOCALAPPDATA%\\Google\\Chrome\\User Data",
+           L"%LOCALAPPDATA%\\Chromium\\User Data",
+           L"%LOCALAPPDATA%\\Microsoft\\Edge\\User Data",
+       }) {
+    std::wstring expanded = ExpandEnvironmentPath(rel);
+    while (!expanded.empty() && expanded.back() == L'\0') {
+      expanded.pop_back();
+    }
+    if (!expanded.empty() &&
+        ::GetFileAttributesW(expanded.c_str()) != INVALID_FILE_ATTRIBUTES) {
+      return expanded;
+    }
   }
-  return std::wstring(dir);
+  return std::nullopt;
 }
 
 std::optional<std::wstring> GetActiveProfileDir() {
@@ -558,24 +601,52 @@ std::optional<std::wstring> GetActiveProfileDir() {
   if (!user_data) {
     return std::nullopt;
   }
-  std::wstring profile_name = L"Default";
+
+  // Try Local State's profile.last_used first.
   const std::wstring local_state = *user_data + L"\\Local State";
-  if (const auto json = ReadFileSharedUtf8(local_state, 4 * 1024 * 1024)) {
+  if (const auto json = ReadFileSharedUtf8(local_state, 16 * 1024 * 1024)) {
     if (const auto last = ParseLastUsedProfile(*json)) {
-      profile_name = *last;
+      std::wstring candidate = *user_data + L"\\" + *last;
+      if (HasBookmarksFile(candidate)) {
+        return candidate;
+      }
     }
   }
-  std::wstring candidate = *user_data + L"\\" + profile_name;
-  if (::GetFileAttributesW((candidate + L"\\Bookmarks").c_str()) !=
-      INVALID_FILE_ATTRIBUTES) {
-    return candidate;
+
+  // Common profile names.
+  for (const wchar_t* name :
+       {L"Default", L"Profile 1", L"Profile 2", L"Profile 3"}) {
+    std::wstring candidate = *user_data + L"\\" + name;
+    if (HasBookmarksFile(candidate)) {
+      return candidate;
+    }
   }
-  std::wstring fallback = *user_data + L"\\Default";
-  if (::GetFileAttributesW((fallback + L"\\Bookmarks").c_str()) !=
-      INVALID_FILE_ATTRIBUTES) {
-    return fallback;
+
+  // Scan subdirectories for the most recently modified Bookmarks file.
+  WIN32_FIND_DATAW fd{};
+  HANDLE find = ::FindFirstFileW((*user_data + L"\\*").c_str(), &fd);
+  std::wstring best_dir;
+  uint64_t best_time = 0;
+  if (find != INVALID_HANDLE_VALUE) {
+    do {
+      if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+          fd.cFileName[0] != L'.') {
+        std::wstring dir = *user_data + L"\\" + fd.cFileName;
+        if (auto stamp = GetFileStamp(dir + L"\\Bookmarks")) {
+          if (stamp->write_time >= best_time) {
+            best_time = stamp->write_time;
+            best_dir = std::move(dir);
+          }
+        }
+      }
+    } while (::FindNextFileW(find, &fd));
+    ::FindClose(find);
   }
-  return candidate;
+  if (!best_dir.empty()) {
+    return best_dir;
+  }
+
+  return *user_data + L"\\Default";
 }
 
 std::shared_ptr<FaviconBitmap> DecodePngToPbgra(
