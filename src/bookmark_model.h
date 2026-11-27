@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -62,6 +63,25 @@ class BookmarkModel {
                     const std::wstring& anchor_id,
                     bool insert_after,
                     bool show_other_bookmarks);
+
+  bool UpdateBookmark(BookmarkSource source,
+                      const std::wstring& node_id,
+                      const std::wstring& new_title,
+                      const std::optional<std::wstring>& new_url,
+                      bool show_other_bookmarks);
+
+  bool AddBookmarkOrFolder(BookmarkSource dst_source,
+                           const std::wstring& dst_folder_id,
+                           const std::wstring& anchor_id,
+                           bool insert_after,
+                           bool is_folder,
+                           const std::wstring& title,
+                           const std::wstring& url,
+                           bool show_other_bookmarks);
+
+  bool DeleteBookmark(BookmarkSource source,
+                      const std::wstring& node_id,
+                      bool show_other_bookmarks);
 
   // Returns diagnostic status when root items are empty.
   std::wstring GetDiagnosticInfo() const;

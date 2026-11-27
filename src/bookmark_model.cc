@@ -1458,6 +1458,75 @@ std::wstring BookmarkSourcePath(const std::wstring& profile_dir,
                                              : L"\\Bookmarks");
 }
 
+std::string GenerateUuidV4() {
+  uint8_t b[16] = {};
+  if (::BCryptGenRandom(nullptr, b, sizeof(b),
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+    const uint64_t t1 = ::GetTickCount64() ^
+                        (static_cast<uint64_t>(::GetCurrentProcessId()) << 32);
+    const uint64_t t2 = t1 * 6364136223846793005ULL + 1442695040888963407ULL;
+    std::memcpy(b, &t1, 8);
+    std::memcpy(b + 8, &t2, 8);
+  }
+  b[6] = static_cast<uint8_t>((b[6] & 0x0F) | 0x40);  // version 4
+  b[8] = static_cast<uint8_t>((b[8] & 0x3F) | 0x80);  // variant 1
+
+  constexpr char kHex[] = "0123456789abcdef";
+  std::string out;
+  out.reserve(36);
+  for (int i = 0; i < 16; ++i) {
+    if (i == 4 || i == 6 || i == 8 || i == 10) {
+      out.push_back('-');
+    }
+    out.push_back(kHex[b[i] >> 4]);
+    out.push_back(kHex[b[i] & 0x0F]);
+  }
+  return out;
+}
+
+JsonValue* FindNodeByIdRecursive(JsonValue& node,
+                                 std::string_view target_id,
+                                 JsonValue** out_parent) {
+  if (node.type != JsonValue::Type::kObject) {
+    return nullptr;
+  }
+  if (JsonValue* children = node.Find("children");
+      children && children->type == JsonValue::Type::kArray) {
+    for (auto& child : children->arr_val) {
+      if (child.GetString("id") == target_id) {
+        if (out_parent) {
+          *out_parent = &node;
+        }
+        return &child;
+      }
+      if (child.GetString("type") == "folder") {
+        if (JsonValue* hit =
+                FindNodeByIdRecursive(child, target_id, out_parent)) {
+          return hit;
+        }
+      }
+    }
+  }
+  return nullptr;
+}
+
+JsonValue* FindNodeByIdInDoc(JsonValue& doc,
+                             std::string_view target_id,
+                             JsonValue** out_parent) {
+  JsonValue* roots = doc.Find("roots");
+  if (!roots || roots->type != JsonValue::Type::kObject) {
+    return nullptr;
+  }
+  for (const char* key : {"bookmark_bar", "other", "synced"}) {
+    if (JsonValue* r = roots->Find(key)) {
+      if (JsonValue* hit = FindNodeByIdRecursive(*r, target_id, out_parent)) {
+        return hit;
+      }
+    }
+  }
+  return nullptr;
+}
+
 }  // namespace
 
 BookmarkModel& BookmarkModel::Instance() {
@@ -1695,6 +1764,223 @@ bool BookmarkModel::MoveBookmark(BookmarkSource src_source,
   }
 
   // Force immediate reload into memory.
+  {
+    auto& store = GetStore();
+    std::lock_guard lock(store.mutex);
+    store.bookmarks_stamp = CombinedBookmarkStamp{};
+  }
+  EnsureLoaded(show_other_bookmarks);
+  return true;
+}
+
+bool BookmarkModel::UpdateBookmark(BookmarkSource source,
+                                   const std::wstring& node_id,
+                                   const std::wstring& new_title,
+                                   const std::optional<std::wstring>& new_url,
+                                   bool show_other_bookmarks) {
+  if (node_id.empty() || node_id == L"__other__" || node_id == L"__empty__") {
+    return false;
+  }
+
+  std::wstring profile_dir;
+  {
+    auto& store = GetStore();
+    std::lock_guard lock(store.mutex);
+    profile_dir = store.profile_dir;
+  }
+  if (profile_dir.empty()) {
+    return false;
+  }
+
+  const std::wstring path = BookmarkSourcePath(profile_dir, source);
+  const auto text = ReadFileSharedUtf8(path, 64 * 1024 * 1024);
+  if (!text) {
+    return false;
+  }
+  JsonValue doc;
+  AstJsonParser parser(*text);
+  if (!parser.Parse(doc)) {
+    return false;
+  }
+
+  JsonValue* parent = nullptr;
+  JsonValue* node = FindNodeByIdInDoc(doc, WideToUtf8(node_id), &parent);
+  if (!node) {
+    return false;
+  }
+
+  node->SetString("name", WideToUtf8(new_title));
+  if (new_url.has_value() && node->GetString("type") == "url") {
+    node->SetString("url", WideToUtf8(*new_url));
+  }
+  const std::string now_ts = std::to_string(GetChromeWebKitTimestamp());
+  if (node->GetString("type") == "folder") {
+    node->SetString("date_modified", now_ts);
+  }
+  if (parent) {
+    parent->SetString("date_modified", now_ts);
+  }
+
+  if (!SaveBookmarkDoc(path, doc)) {
+    return false;
+  }
+
+  {
+    auto& store = GetStore();
+    std::lock_guard lock(store.mutex);
+    store.bookmarks_stamp = CombinedBookmarkStamp{};
+  }
+  EnsureLoaded(show_other_bookmarks);
+  return true;
+}
+
+bool BookmarkModel::AddBookmarkOrFolder(BookmarkSource dst_source,
+                                        const std::wstring& dst_folder_id,
+                                        const std::wstring& anchor_id,
+                                        bool insert_after,
+                                        bool is_folder,
+                                        const std::wstring& title,
+                                        const std::wstring& url,
+                                        bool show_other_bookmarks) {
+  if (!is_folder && url.empty()) {
+    return false;
+  }
+
+  std::wstring profile_dir;
+  {
+    auto& store = GetStore();
+    std::lock_guard lock(store.mutex);
+    profile_dir = store.profile_dir;
+  }
+  if (profile_dir.empty()) {
+    return false;
+  }
+
+  const std::wstring path = BookmarkSourcePath(profile_dir, dst_source);
+  const auto text = ReadFileSharedUtf8(path, 64 * 1024 * 1024);
+  if (!text) {
+    return false;
+  }
+  JsonValue doc;
+  AstJsonParser parser(*text);
+  if (!parser.Parse(doc)) {
+    return false;
+  }
+
+  JsonValue* dst_folder =
+      ResolveDestinationFolder(doc, WideToUtf8(dst_folder_id));
+  if (!dst_folder) {
+    return false;
+  }
+  JsonValue* dst_children = dst_folder->Find("children");
+  if (!dst_children) {
+    JsonValue empty_arr;
+    empty_arr.type = JsonValue::Type::kArray;
+    dst_folder->obj_val.emplace_back("children", std::move(empty_arr));
+    dst_children = dst_folder->Find("children");
+  }
+  if (!dst_children || dst_children->type != JsonValue::Type::kArray) {
+    return false;
+  }
+
+  uint64_t max_id = 0;
+  if (const JsonValue* roots = doc.Find("roots")) {
+    for (const char* key : {"bookmark_bar", "other", "synced"}) {
+      if (const JsonValue* r = roots->Find(key)) {
+        FindMaxNumericId(*r, max_id);
+      }
+    }
+  }
+
+  const std::string now_ts = std::to_string(GetChromeWebKitTimestamp());
+  JsonValue new_node;
+  new_node.type = JsonValue::Type::kObject;
+  if (is_folder) {
+    JsonValue empty_arr;
+    empty_arr.type = JsonValue::Type::kArray;
+    new_node.obj_val.emplace_back("children", std::move(empty_arr));
+    new_node.SetString("date_added", now_ts);
+    new_node.SetString("date_last_used", "0");
+    new_node.SetString("date_modified", now_ts);
+    new_node.SetString("guid", GenerateUuidV4());
+    new_node.SetString("id", std::to_string(max_id + 1));
+    new_node.SetString("name", WideToUtf8(title));
+    new_node.SetString("type", "folder");
+  } else {
+    new_node.SetString("date_added", now_ts);
+    new_node.SetString("date_last_used", "0");
+    new_node.SetString("guid", GenerateUuidV4());
+    new_node.SetString("id", std::to_string(max_id + 1));
+    new_node.SetString("name", WideToUtf8(title.empty() ? url : title));
+    new_node.SetString("type", "url");
+    new_node.SetString("url", WideToUtf8(url));
+  }
+
+  const std::string anchor_u8 = WideToUtf8(anchor_id);
+  size_t insert_pos = dst_children->arr_val.size();
+  if (!anchor_u8.empty()) {
+    for (size_t i = 0; i < dst_children->arr_val.size(); ++i) {
+      if (dst_children->arr_val[i].GetString("id") == anchor_u8) {
+        insert_pos = insert_after ? (i + 1) : i;
+        break;
+      }
+    }
+  }
+  dst_children->arr_val.insert(
+      dst_children->arr_val.begin() + static_cast<ptrdiff_t>(insert_pos),
+      std::move(new_node));
+  dst_folder->SetString("date_modified", now_ts);
+
+  if (!SaveBookmarkDoc(path, doc)) {
+    return false;
+  }
+
+  {
+    auto& store = GetStore();
+    std::lock_guard lock(store.mutex);
+    store.bookmarks_stamp = CombinedBookmarkStamp{};
+  }
+  EnsureLoaded(show_other_bookmarks);
+  return true;
+}
+
+bool BookmarkModel::DeleteBookmark(BookmarkSource source,
+                                   const std::wstring& node_id,
+                                   bool show_other_bookmarks) {
+  if (node_id.empty() || node_id == L"__other__" || node_id == L"__empty__") {
+    return false;
+  }
+
+  std::wstring profile_dir;
+  {
+    auto& store = GetStore();
+    std::lock_guard lock(store.mutex);
+    profile_dir = store.profile_dir;
+  }
+  if (profile_dir.empty()) {
+    return false;
+  }
+
+  const std::wstring path = BookmarkSourcePath(profile_dir, source);
+  const auto text = ReadFileSharedUtf8(path, 64 * 1024 * 1024);
+  if (!text) {
+    return false;
+  }
+  JsonValue doc;
+  AstJsonParser parser(*text);
+  if (!parser.Parse(doc)) {
+    return false;
+  }
+
+  JsonValue removed;
+  if (!ExtractNodeFromDoc(doc, WideToUtf8(node_id), removed)) {
+    return false;
+  }
+
+  if (!SaveBookmarkDoc(path, doc)) {
+    return false;
+  }
+
   {
     auto& store = GetStore();
     std::lock_guard lock(store.mutex);

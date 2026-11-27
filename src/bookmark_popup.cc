@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
@@ -33,8 +34,10 @@ using Microsoft::WRL::ComPtr;
 
 constexpr wchar_t kPopupClassName[] = L"ChromePlusBookmarkPopup";
 constexpr wchar_t kDragBadgeClassName[] = L"ChromePlusBookmarkDragBadge";
+constexpr wchar_t kEditDialogClassName[] = L"ChromePlusBookmarkEditDialog";
 constexpr UINT kMsgFaviconReady = WM_APP + 0x41;
-constexpr UINT_PTR kHoverTimerId = 0x424D4856;  // 'BMHV'
+constexpr UINT_PTR kHoverTimerId = 0x424D4856;      // 'BMHV'
+constexpr UINT_PTR kBatchOpenTimerId = 0x424D424F;  // 'BMBO'
 constexpr UINT kHoverDelayNormalMs = 110;
 constexpr UINT kHoverDelaySafeTriangleMs = 280;
 constexpr UINT kDefaultDpi = 96;
@@ -298,6 +301,8 @@ struct PopupManagerState {
   std::shared_ptr<const std::vector<BookmarkNode>> root_snapshot;
   std::vector<std::unique_ptr<PopupWindow>> stack;
   DragState drag;
+  bool modal_ui_active = false;
+  std::vector<std::wstring> batch_open_urls;
   bool class_registered = false;
   bool hooks_registered = false;
 };
@@ -1259,10 +1264,10 @@ void CommitItemDrag(POINT release_screen) {
 
   if (action == DropAction::kSuperDrag) {
     if (!src_node.url.empty() && mgr.chrome_root) {
-      // Allow dropping either over Chrome or via horizontal flick over popup.
+      // Keep the bookmark popup open so the user can continuously drag open
+      // multiple bookmarks in background tabs while staying on the current page.
       HWND root = mgr.chrome_root;
       std::wstring url = src_node.url;
-      CloseAllBookmarkPopups();
       OpenInNewTab(root, std::move(url), /*background=*/true);
     }
     return;
@@ -1317,9 +1322,471 @@ void CommitItemDrag(POINT release_screen) {
   }
 }
 
+void CopyTextToClipboard(HWND owner, const std::wstring& text) {
+  if (text.empty() || !::OpenClipboard(owner)) {
+    return;
+  }
+  ::EmptyClipboard();
+  const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+  HGLOBAL mem = ::GlobalAlloc(GMEM_MOVEABLE, bytes);
+  if (mem) {
+    if (void* dst = ::GlobalLock(mem)) {
+      std::memcpy(dst, text.c_str(), bytes);
+      ::GlobalUnlock(mem);
+      ::SetClipboardData(CF_UNICODETEXT, mem);
+    } else {
+      ::GlobalFree(mem);
+    }
+  }
+  ::CloseClipboard();
+}
+
+void StartBatchBackgroundOpen(std::vector<std::wstring> urls) {
+  auto& mgr = GetManager();
+  if (urls.empty() || !mgr.chrome_root || mgr.stack.empty()) {
+    return;
+  }
+  std::wstring first = std::move(urls.front());
+  urls.erase(urls.begin());
+  OpenInNewTab(mgr.chrome_root, std::move(first), /*background=*/true);
+  if (!urls.empty()) {
+    mgr.batch_open_urls = std::move(urls);
+    ::SetTimer(mgr.stack[0]->hwnd, kBatchOpenTimerId, 90, nullptr);
+  }
+}
+
+struct EditDialogContext {
+  HWND title_edit = nullptr;
+  HWND url_edit = nullptr;
+  bool has_url = false;
+  bool accepted = false;
+  bool done = false;
+  std::wstring title_out;
+  std::wstring url_out;
+};
+
+constexpr int kEditTitleId = 1001;
+constexpr int kEditUrlId = 1002;
+
+LRESULT CALLBACK EditDialogWndProc(HWND hwnd,
+                                   UINT msg,
+                                   WPARAM wParam,
+                                   LPARAM lParam) {
+  auto* ctx = reinterpret_cast<EditDialogContext*>(
+      ::GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+  switch (msg) {
+    case WM_CREATE: {
+      const auto* cs = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+      ::SetWindowLongPtrW(
+          hwnd, GWLP_USERDATA,
+          reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+      return 0;
+    }
+    case WM_COMMAND: {
+      const WORD id = LOWORD(wParam);
+      if (id == IDOK && ctx) {
+        auto read_edit = [](HWND edit) {
+          const int len = ::GetWindowTextLengthW(edit);
+          std::wstring s(static_cast<size_t>(std::max(0, len)), L'\0');
+          if (len > 0) {
+            ::GetWindowTextW(edit, s.data(), len + 1);
+          }
+          while (!s.empty() && (s.back() == L' ' || s.back() == L'\t')) {
+            s.pop_back();
+          }
+          size_t start = 0;
+          while (start < s.size() && (s[start] == L' ' || s[start] == L'\t')) {
+            ++start;
+          }
+          return s.substr(start);
+        };
+        ctx->title_out = read_edit(ctx->title_edit);
+        if (ctx->has_url && ctx->url_edit) {
+          ctx->url_out = read_edit(ctx->url_edit);
+        }
+        ctx->accepted = true;
+        ctx->done = true;
+        return 0;
+      }
+      if (id == IDCANCEL && ctx) {
+        ctx->accepted = false;
+        ctx->done = true;
+        return 0;
+      }
+      break;
+    }
+    case WM_CLOSE:
+      if (ctx) {
+        ctx->accepted = false;
+        ctx->done = true;
+      }
+      return 0;
+  }
+  return ::DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+bool ShowBookmarkEditDialog(HWND owner,
+                            const std::wstring& dialog_title,
+                            bool has_url,
+                            std::wstring& title_io,
+                            std::wstring& url_io) {
+  const UINT dpi = GetDpiForWindowSafe(owner);
+  const int dlg_w = ScalePx(380, dpi);
+  const int dlg_h = ScalePx(has_url ? 190 : 132, dpi);
+
+  POINT cursor{};
+  ::GetCursorPos(&cursor);
+  const RECT work = GetWorkAreaAtPoint(cursor);
+  int x = (work.left + work.right - dlg_w) / 2;
+  int y = (work.top + work.bottom - dlg_h) / 2;
+  if (owner && ::IsWindow(owner)) {
+    RECT orc{};
+    if (::GetWindowRect(owner, &orc)) {
+      x = std::clamp(static_cast<int>((orc.left + orc.right - dlg_w) / 2),
+                     static_cast<int>(work.left + 12),
+                     static_cast<int>(work.right - dlg_w - 12));
+      y = std::clamp(static_cast<int>((orc.top + orc.bottom - dlg_h) / 2),
+                     static_cast<int>(work.top + 12),
+                     static_cast<int>(work.bottom - dlg_h - 12));
+    }
+  }
+
+  EditDialogContext ctx;
+  ctx.has_url = has_url;
+
+  HWND dlg = ::CreateWindowExW(
+      WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, kEditDialogClassName,
+      dialog_title.c_str(), WS_POPUP | WS_CAPTION | WS_SYSMENU, x, y, dlg_w,
+      dlg_h, owner, nullptr, hInstance, &ctx);
+  if (!dlg) {
+    return false;
+  }
+
+  HFONT font = ::CreateFontW(
+      -ScalePx(14, dpi), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+      DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+      CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Microsoft YaHei UI");
+
+  RECT crc{};
+  ::GetClientRect(dlg, &crc);
+  const int cw = crc.right - crc.left;
+  const int ch = crc.bottom - crc.top;
+  const int pad = ScalePx(14, dpi);
+  const int lbl_w = ScalePx(48, dpi);
+  const int edit_h = ScalePx(26, dpi);
+  const int edit_x = pad + lbl_w + ScalePx(6, dpi);
+  const int edit_w = cw - edit_x - pad;
+
+  auto apply_font = [&](HWND ctrl) {
+    if (ctrl && font) {
+      ::SendMessageW(ctrl, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+    }
+  };
+
+  int cur_y = pad;
+  HWND lbl1 = ::CreateWindowExW(
+      0, L"STATIC", L"名称：", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, pad,
+      cur_y, lbl_w, edit_h, dlg, nullptr, hInstance, nullptr);
+  ctx.title_edit = ::CreateWindowExW(
+      WS_EX_CLIENTEDGE, L"EDIT", title_io.c_str(),
+      WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, edit_x, cur_y,
+      edit_w, edit_h, dlg, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kEditTitleId)),
+      hInstance, nullptr);
+  apply_font(lbl1);
+  apply_font(ctx.title_edit);
+  cur_y += edit_h + ScalePx(12, dpi);
+
+  if (has_url) {
+    HWND lbl2 = ::CreateWindowExW(
+        0, L"STATIC", L"网址：", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE, pad,
+        cur_y, lbl_w, edit_h, dlg, nullptr, hInstance, nullptr);
+    ctx.url_edit = ::CreateWindowExW(
+        WS_EX_CLIENTEDGE, L"EDIT", url_io.c_str(),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, edit_x, cur_y,
+        edit_w, edit_h, dlg, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kEditUrlId)),
+        hInstance, nullptr);
+    apply_font(lbl2);
+    apply_font(ctx.url_edit);
+  }
+
+  const int btn_w = ScalePx(80, dpi);
+  const int btn_h = ScalePx(28, dpi);
+  const int btn_y = ch - pad - btn_h;
+  HWND cancel_btn = ::CreateWindowExW(
+      0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+      cw - pad - btn_w, btn_y, btn_w, btn_h, dlg,
+      reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDCANCEL)), hInstance,
+      nullptr);
+  HWND ok_btn = ::CreateWindowExW(
+      0, L"BUTTON", L"确定",
+      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+      cw - pad - btn_w * 2 - ScalePx(10, dpi), btn_y, btn_w, btn_h, dlg,
+      reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDOK)), hInstance, nullptr);
+  apply_font(cancel_btn);
+  apply_font(ok_btn);
+
+  ::ShowWindow(dlg, SW_SHOW);
+  ::SetForegroundWindow(dlg);
+  ::SetFocus(ctx.title_edit);
+  ::SendMessageW(ctx.title_edit, EM_SETSEL, 0, -1);
+
+  MSG msg{};
+  while (!ctx.done && ::GetMessageW(&msg, nullptr, 0, 0) > 0) {
+    if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+      ctx.accepted = false;
+      ctx.done = true;
+      break;
+    }
+    if (!::IsDialogMessageW(dlg, &msg)) {
+      ::TranslateMessage(&msg);
+      ::DispatchMessageW(&msg);
+    }
+  }
+
+  ::DestroyWindow(dlg);
+  if (font) {
+    ::DeleteObject(font);
+  }
+
+  if (ctx.accepted) {
+    title_io = std::move(ctx.title_out);
+    if (has_url) {
+      url_io = std::move(ctx.url_out);
+    }
+    return true;
+  }
+  return false;
+}
+
+void ShowContextMenuForPopup(PopupWindow* win,
+                             POINT client_pt,
+                             POINT screen_pt) {
+  auto& mgr = GetManager();
+  if (mgr.modal_ui_active) {
+    return;
+  }
+
+  const int hit = HitTestItem(win, client_pt);
+  const auto& items = GetItemsRef(win);
+  const bool has_item = (hit >= 0 && hit < static_cast<int>(items.size()));
+  const BookmarkNode target_node = has_item ? items[hit] : BookmarkNode{};
+
+  enum MenuCmd : UINT {
+    kCmdOpenFg = 101,
+    kCmdOpenBg = 102,
+    kCmdCopyUrl = 103,
+    kCmdOpenAllBg = 104,
+    kCmdEdit = 105,
+    kCmdDelete = 106,
+    kCmdAddBookmarkHere = 107,
+    kCmdAddFolderHere = 108,
+    kCmdAddBookmarkInside = 109,
+    kCmdAddFolderInside = 110,
+    kCmdOpenManager = 111,
+  };
+
+  HMENU menu = ::CreatePopupMenu();
+  if (!menu) {
+    return;
+  }
+
+  std::vector<std::wstring> folder_urls;
+  if (has_item && target_node.is_folder) {
+    for (const auto& ch : target_node.children) {
+      if (!ch.is_folder && !ch.url.empty()) {
+        folder_urls.push_back(ch.url);
+      }
+    }
+  }
+
+  if (has_item && !target_node.is_folder) {
+    ::AppendMenuW(menu, MF_STRING, kCmdOpenFg, L"前台新标签页打开");
+    ::AppendMenuW(menu, MF_STRING, kCmdOpenBg, L"后台新标签页打开");
+    ::AppendMenuW(menu, MF_STRING, kCmdCopyUrl, L"复制网址");
+    ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    ::AppendMenuW(menu, MF_STRING, kCmdEdit, L"编辑书签...");
+    ::AppendMenuW(menu, MF_STRING, kCmdDelete, L"删除书签");
+    ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    ::AppendMenuW(menu, MF_STRING, kCmdAddBookmarkHere, L"在此处新建书签...");
+    ::AppendMenuW(menu, MF_STRING, kCmdAddFolderHere, L"在此处新建文件夹...");
+  } else if (has_item && target_node.is_folder) {
+    if (!folder_urls.empty()) {
+      const std::wstring open_all_lbl =
+          L"后台打开全部书签 (" + std::to_wstring(folder_urls.size()) + L")";
+      ::AppendMenuW(menu, MF_STRING, kCmdOpenAllBg, open_all_lbl.c_str());
+      ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    }
+    if (!target_node.is_virtual_root) {
+      ::AppendMenuW(menu, MF_STRING, kCmdEdit, L"重命名文件夹...");
+    }
+    ::AppendMenuW(menu, MF_STRING, kCmdAddBookmarkInside,
+                  L"在文件夹内新建书签...");
+    ::AppendMenuW(menu, MF_STRING, kCmdAddFolderInside,
+                  L"在文件夹内新建子文件夹...");
+    if (!target_node.is_virtual_root) {
+      ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+      ::AppendMenuW(menu, MF_STRING, kCmdDelete, L"删除文件夹");
+    }
+  } else {
+    ::AppendMenuW(menu, MF_STRING, kCmdAddBookmarkHere, L"新建书签...");
+    ::AppendMenuW(menu, MF_STRING, kCmdAddFolderHere, L"新建文件夹...");
+    ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    ::AppendMenuW(menu, MF_STRING, kCmdOpenManager, L"打开 Chrome 书签管理器");
+  }
+
+  mgr.modal_ui_active = true;
+  const UINT cmd = static_cast<UINT>(::TrackPopupMenuEx(
+      menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, screen_pt.x,
+      screen_pt.y, win->hwnd, nullptr));
+  ::DestroyMenu(menu);
+
+  if (cmd == 0) {
+    mgr.modal_ui_active = false;
+    return;
+  }
+
+  const BookmarkSource container_src =
+      has_item ? target_node.source : win->folder_source;
+  const std::wstring container_folder_id = win->folder_id;
+  const std::wstring anchor_id =
+      (has_item && !target_node.is_virtual_root) ? target_node.id : L"";
+  HWND dlg_owner = mgr.chrome_root ? mgr.chrome_root : win->hwnd;
+
+  switch (cmd) {
+    case kCmdOpenFg:
+      mgr.modal_ui_active = false;
+      ExecuteBookmarkClick(win, hit, /*background=*/false);
+      return;
+    case kCmdOpenBg:
+      mgr.modal_ui_active = false;
+      ExecuteBookmarkClick(win, hit, /*background=*/true);
+      return;
+    case kCmdCopyUrl:
+      CopyTextToClipboard(win->hwnd, target_node.url);
+      break;
+    case kCmdOpenAllBg:
+      mgr.modal_ui_active = false;
+      StartBatchBackgroundOpen(std::move(folder_urls));
+      return;
+    case kCmdOpenManager:
+      mgr.modal_ui_active = false;
+      if (HWND root = mgr.chrome_root) {
+        CloseAllBookmarkPopups();
+        OpenInNewTab(root, L"chrome://bookmarks/", /*background=*/false);
+      }
+      return;
+    case kCmdEdit: {
+      std::wstring title = target_node.title;
+      std::wstring url = target_node.url;
+      const bool is_url = !target_node.is_folder;
+      if (ShowBookmarkEditDialog(dlg_owner,
+                                 is_url ? L"编辑书签" : L"重命名文件夹", is_url,
+                                 title, url)) {
+        if (!is_url && title.empty()) {
+          break;
+        }
+        if (is_url && url.empty()) {
+          break;
+        }
+        if (BookmarkModel::Instance().UpdateBookmark(
+                target_node.source, target_node.id, title,
+                is_url ? std::optional<std::wstring>(url) : std::nullopt,
+                config.IsBookmarksShowOther())) {
+          ReloadPopupStackItems();
+        }
+      }
+      break;
+    }
+    case kCmdDelete: {
+      bool confirmed = true;
+      if (target_node.is_folder && !target_node.children.empty()) {
+        const std::wstring prompt =
+            L"确定要删除文件夹「" + target_node.title + L"」及其中的 " +
+            std::to_wstring(target_node.children.size()) + L" 个项目吗？";
+        confirmed = (::MessageBoxW(dlg_owner, prompt.c_str(), L"删除文件夹",
+                                   MB_YESNO | MB_ICONWARNING | MB_TOPMOST) ==
+                     IDYES);
+      }
+      if (confirmed &&
+          BookmarkModel::Instance().DeleteBookmark(
+              target_node.source, target_node.id,
+              config.IsBookmarksShowOther())) {
+        ReloadPopupStackItems();
+      }
+      break;
+    }
+    case kCmdAddBookmarkHere: {
+      std::wstring title;
+      std::wstring url = L"https://";
+      if (ShowBookmarkEditDialog(dlg_owner, L"新建书签", true, title, url) &&
+          !url.empty()) {
+        if (BookmarkModel::Instance().AddBookmarkOrFolder(
+                container_src, container_folder_id, anchor_id,
+                /*insert_after=*/true, /*is_folder=*/false, title, url,
+                config.IsBookmarksShowOther())) {
+          ReloadPopupStackItems();
+        }
+      }
+      break;
+    }
+    case kCmdAddFolderHere: {
+      std::wstring title = L"新建文件夹";
+      std::wstring dummy_url;
+      if (ShowBookmarkEditDialog(dlg_owner, L"新建文件夹", false, title,
+                                 dummy_url) &&
+          !title.empty()) {
+        if (BookmarkModel::Instance().AddBookmarkOrFolder(
+                container_src, container_folder_id, anchor_id,
+                /*insert_after=*/true, /*is_folder=*/true, title, L"",
+                config.IsBookmarksShowOther())) {
+          ReloadPopupStackItems();
+        }
+      }
+      break;
+    }
+    case kCmdAddBookmarkInside: {
+      std::wstring title;
+      std::wstring url = L"https://";
+      const std::wstring dst_fid =
+          target_node.is_virtual_root ? L"__other__" : target_node.id;
+      if (ShowBookmarkEditDialog(dlg_owner, L"在文件夹内新建书签", true, title,
+                                 url) &&
+          !url.empty()) {
+        if (BookmarkModel::Instance().AddBookmarkOrFolder(
+                target_node.source, dst_fid, L"", /*insert_after=*/true,
+                /*is_folder=*/false, title, url,
+                config.IsBookmarksShowOther())) {
+          ReloadPopupStackItems();
+        }
+      }
+      break;
+    }
+    case kCmdAddFolderInside: {
+      std::wstring title = L"新建文件夹";
+      std::wstring dummy_url;
+      const std::wstring dst_fid =
+          target_node.is_virtual_root ? L"__other__" : target_node.id;
+      if (ShowBookmarkEditDialog(dlg_owner, L"在文件夹内新建子文件夹", false,
+                                 title, dummy_url) &&
+          !title.empty()) {
+        if (BookmarkModel::Instance().AddBookmarkOrFolder(
+                target_node.source, dst_fid, L"", /*insert_after=*/true,
+                /*is_folder=*/true, title, L"",
+                config.IsBookmarksShowOther())) {
+          ReloadPopupStackItems();
+        }
+      }
+      break;
+    }
+  }
+
+  mgr.modal_ui_active = false;
+}
+
 void HandleHoverTimer(PopupWindow* win) {
   ::KillTimer(win->hwnd, kHoverTimerId);
-  if (GetManager().drag.active) {
+  const auto& mgr = GetManager();
+  if (mgr.drag.active || mgr.modal_ui_active) {
     return;
   }
   const int target = win->pending_hover_index;
@@ -1443,6 +1910,21 @@ LRESULT CALLBACK PopupWndProc(HWND hwnd,
         HandleHoverTimer(win);
         return 0;
       }
+      if (wParam == kBatchOpenTimerId) {
+        auto& mgr = GetManager();
+        if (mgr.batch_open_urls.empty() || !mgr.chrome_root) {
+          ::KillTimer(hwnd, kBatchOpenTimerId);
+          mgr.batch_open_urls.clear();
+          return 0;
+        }
+        std::wstring next_url = std::move(mgr.batch_open_urls.front());
+        mgr.batch_open_urls.erase(mgr.batch_open_urls.begin());
+        if (mgr.batch_open_urls.empty()) {
+          ::KillTimer(hwnd, kBatchOpenTimerId);
+        }
+        OpenInNewTab(mgr.chrome_root, std::move(next_url), /*background=*/true);
+        return 0;
+      }
       break;
 
     case WM_MOUSEMOVE: {
@@ -1490,6 +1972,10 @@ LRESULT CALLBACK PopupWndProc(HWND hwnd,
         }
       }
 
+      if (GetManager().modal_ui_active) {
+        return 0;
+      }
+
       POINT cur_screen = pt;
       ::ClientToScreen(hwnd, &cur_screen);
 
@@ -1527,6 +2013,17 @@ LRESULT CALLBACK PopupWndProc(HWND hwnd,
         return 0;
       }
       return 0;
+
+    case WM_RBUTTONUP: {
+      if (win->resize_mode != ResizeMode::kNone || GetManager().drag.active) {
+        return 0;
+      }
+      POINT client_pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+      POINT screen_pt = client_pt;
+      ::ClientToScreen(hwnd, &screen_pt);
+      ShowContextMenuForPopup(win, client_pt, screen_pt);
+      return 0;
+    }
 
     case WM_LBUTTONDOWN: {
       POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
@@ -1643,24 +2140,38 @@ void EnsureWindowClassRegistered() {
   badge_wc.lpszClassName = kDragBadgeClassName;
   ::RegisterClassExW(&badge_wc);
 
+  WNDCLASSEXW dlg_wc{sizeof(dlg_wc)};
+  dlg_wc.lpfnWndProc = EditDialogWndProc;
+  dlg_wc.hInstance = hInstance;
+  dlg_wc.hCursor = ::LoadCursorW(nullptr, IDC_ARROW);
+  dlg_wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+  dlg_wc.lpszClassName = kEditDialogClassName;
+  ::RegisterClassExW(&dlg_wc);
+
   mgr.class_registered = true;
+}
+
+RECT GetItemScreenRect(const PopupWindow* parent, int item_index) {
+  const RECT item_rc = GetItemRect(parent, item_index);
+  POINT tl{item_rc.left, item_rc.top};
+  POINT br{item_rc.right, item_rc.bottom};
+  ::ClientToScreen(parent->hwnd, &tl);
+  ::ClientToScreen(parent->hwnd, &br);
+  return RECT{tl.x, tl.y, br.x, br.y};
 }
 
 void RelayoutAndResizePopup(PopupWindow* win, bool is_reposition) {
   int x = 0;
   int y = 0;
-  RECT parent_rect{};
+  RECT ref_rect{};
   POINT anchor = GetManager().root_anchor_pt;
   if (win->level > 0 &&
       win->level - 1 < static_cast<int>(GetManager().stack.size())) {
     const auto& parent = GetManager().stack[win->level - 1];
-    ::GetWindowRect(parent->hwnd, &parent_rect);
-    const RECT item_rc = GetItemRect(parent.get(), win->parent_item_index);
-    POINT item_top_left{item_rc.left, item_rc.top};
-    ::ClientToScreen(parent->hwnd, &item_top_left);
-    anchor = POINT{parent_rect.right, item_top_left.y};
+    ref_rect = GetItemScreenRect(parent.get(), win->parent_item_index);
+    anchor = POINT{ref_rect.right, ref_rect.top};
   }
-  ComputePopupGeometry(win, anchor, win->level > 0, parent_rect, &x, &y);
+  ComputePopupGeometry(win, anchor, win->level > 0, ref_rect, &x, &y);
   UINT flags = SWP_NOZORDER | SWP_NOACTIVATE;
   if (!is_reposition && win->level == 0) {
     flags |= SWP_NOMOVE;
@@ -1727,6 +2238,7 @@ void ClosePopupsFromLevel(int from_level) {
     stack.pop_back();
     if (win->hwnd && ::IsWindow(win->hwnd)) {
       ::KillTimer(win->hwnd, kHoverTimerId);
+      ::KillTimer(win->hwnd, kBatchOpenTimerId);
       ::DestroyWindow(win->hwnd);
     }
   }
@@ -1746,11 +2258,9 @@ void OpenChildPopup(PopupWindow* parent, int item_index) {
   parent->open_child_index = item_index;
   ::InvalidateRect(parent->hwnd, nullptr, FALSE);
 
-  RECT parent_rect{};
-  ::GetWindowRect(parent->hwnd, &parent_rect);
-  const RECT item_rc = GetItemRect(parent, item_index);
-  POINT item_top_left{item_rc.left, item_rc.top};
-  ::ClientToScreen(parent->hwnd, &item_top_left);
+  // Anchor right next to the hovered folder's column edge so hovering a folder
+  // in column 1 floats its submenu directly over column 2 (no long travel).
+  const RECT item_screen_rc = GetItemScreenRect(parent, item_index);
 
   auto children_copy =
       std::make_shared<std::vector<BookmarkNode>>(folder.children);
@@ -1758,8 +2268,9 @@ void OpenChildPopup(PopupWindow* parent, int item_index) {
       folder.is_virtual_root ? L"__other__" : folder.id;
   if (auto child = CreatePopupLevel(
           parent->level + 1, item_index, child_folder_id, folder.source,
-          std::move(children_copy), POINT{parent_rect.right, item_top_left.y},
-          true, parent_rect)) {
+          std::move(children_copy),
+          POINT{item_screen_rc.right, item_screen_rc.top}, true,
+          item_screen_rc)) {
     GetManager().stack.push_back(std::move(child));
   }
 }
@@ -1768,7 +2279,11 @@ bool PopupMouseHook(WPARAM wParam, LPARAM lParam) {
   if (!IsBookmarkPopupOpen()) {
     return false;
   }
-  if (GetManager().drag.active) {
+  auto& mgr = GetManager();
+  if (mgr.modal_ui_active) {
+    return false;
+  }
+  if (mgr.drag.active) {
     if (wParam == WM_RBUTTONDOWN) {
       CancelItemDrag();
       return true;
@@ -1780,7 +2295,7 @@ bool PopupMouseHook(WPARAM wParam, LPARAM lParam) {
       wParam == WM_NCRBUTTONDOWN || wParam == WM_NCMBUTTONDOWN) {
     const auto* pmouse = reinterpret_cast<const MOUSEHOOKSTRUCT*>(lParam);
     HWND target = ::WindowFromPoint(pmouse->pt);
-    if (target == GetManager().trigger_btn || IsBookmarkPopupWindow(target)) {
+    if (target == mgr.trigger_btn || IsBookmarkPopupWindow(target)) {
       return false;
     }
     CloseAllBookmarkPopups();
@@ -1799,6 +2314,9 @@ bool PopupKeyboardHook(WPARAM wParam, LPARAM lParam) {
   }
 
   auto& mgr = GetManager();
+  if (mgr.modal_ui_active) {
+    return false;
+  }
   if (mgr.drag.pressing || mgr.drag.active) {
     if (wParam == VK_ESCAPE) {
       CancelItemDrag();
@@ -1925,6 +2443,8 @@ void ToggleBookmarkPopup(HWND chrome_root,
 void CloseAllBookmarkPopups() {
   CancelItemDrag();
   auto& mgr = GetManager();
+  mgr.modal_ui_active = false;
+  mgr.batch_open_urls.clear();
   if (mgr.drag.badge_hwnd && ::IsWindow(mgr.drag.badge_hwnd)) {
     ::DestroyWindow(mgr.drag.badge_hwnd);
     mgr.drag.badge_hwnd = nullptr;
