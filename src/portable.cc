@@ -146,11 +146,13 @@ struct ProcessedArgs {
   bool has_disk_cache_dir = false;
   bool has_proxy_server = false;
   bool has_proxy_bypass_list = false;
+  bool has_device_scale_factor = false;
+  bool has_top_chrome_touch_ui = false;
 };
 
 ProcessedArgs ProcessAndMergeArgs(const std::vector<std::wstring>& args) {
   ProcessedArgs result;
-  result.final_args.reserve(args.size() + 6);
+  result.final_args.reserve(args.size() + 8);
 
   std::wstring combined_features;
   const std::wstring disable_features_prefix = L"--disable-features=";
@@ -173,6 +175,12 @@ ProcessedArgs ProcessAndMergeArgs(const std::vector<std::wstring>& args) {
       }
       if (arg.starts_with(L"--proxy-bypass-list=")) {
         result.has_proxy_bypass_list = true;
+      }
+      if (arg.starts_with(L"--force-device-scale-factor=")) {
+        result.has_device_scale_factor = true;
+      }
+      if (arg.starts_with(L"--top-chrome-touch-ui=")) {
+        result.has_top_chrome_touch_ui = true;
       }
       result.final_args.push_back(arg);
     }
@@ -224,6 +232,21 @@ void InjectProxyArgs(std::vector<std::wstring>& args,
   }
 }
 
+void InjectUiScaleArgs(std::vector<std::wstring>& args,
+                       bool has_device_scale_factor,
+                       bool has_top_chrome_touch_ui) {
+  const std::wstring& ui_scale = config.GetUiScale();
+  if (ui_scale.empty()) {
+    return;
+  }
+  if (!has_top_chrome_touch_ui) {
+    args.emplace_back(L"--top-chrome-touch-ui=disabled");
+  }
+  if (!has_device_scale_factor) {
+    args.emplace_back(L"--force-device-scale-factor=" + ui_scale);
+  }
+}
+
 // Reassemble final command line from arguments and suffix.
 std::wstring ReassembleCommandLine(const std::vector<std::wstring>& args,
                                    const std::wstring& suffix) {
@@ -268,6 +291,8 @@ std::wstring GetCommand(LPWSTR param) {
                     processed.has_disk_cache_dir);
   InjectProxyArgs(processed.final_args, processed.has_proxy_server,
                   processed.has_proxy_bypass_list);
+  InjectUiScaleArgs(processed.final_args, processed.has_device_scale_factor,
+                    processed.has_top_chrome_touch_ui);
   processed.final_args.insert(processed.final_args.end(), trailing_args.begin(),
                               trailing_args.end());
   return ReassembleCommandLine(processed.final_args, suffix);

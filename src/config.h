@@ -31,6 +31,7 @@ class Config {
     return suppress_false_upgrade_notification_;
   }
   bool IsManagedUpdates() const { return managed_updates_; }
+  const std::wstring& GetUiScale() const { return ui_scale_; }
 
   // proxy
   bool IsProxyEnabled() const { return proxy_enabled_; }
@@ -104,6 +105,7 @@ class Config {
   bool ignore_policies_;
   bool suppress_false_upgrade_notification_;
   bool managed_updates_;
+  std::wstring ui_scale_;
 
   // proxy
   bool proxy_enabled_;

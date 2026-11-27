@@ -32,6 +32,7 @@ void Config::LoadConfig() {
   suppress_false_upgrade_notification_ =
       GetIniInt(L"general", L"suppress_false_upgrade_notification", 0) != 0;
   managed_updates_ = GetIniInt(L"general", L"managed_updates", 0) != 0;
+  ui_scale_ = GetIniString(L"general", L"ui_scale", L"");
 
   // proxy
   proxy_enabled_ = GetIniInt(L"proxy", L"enabled", 0) != 0;

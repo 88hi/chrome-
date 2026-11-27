@@ -269,6 +269,9 @@ std::string BuildConfigJson() {
       first);
   AppendJsonField(json, "win32k", GetIniInt(L"general", L"win32k", 0) != 0,
                   first);
+  AppendJsonField(json, "ui_scale",
+                  WideToUtf8(GetIniString(L"general", L"ui_scale", L"")),
+                  first);
   json += "}}";
   return json;
 }
@@ -477,6 +480,7 @@ constexpr AllowedIniKey kAllowedKeys[] = {
     {"general.suppress_false_upgrade_notification", L"general",
      L"suppress_false_upgrade_notification", true, 0, 1},
     {"general.win32k", L"general", L"win32k", true, 0, 1},
+    {"general.ui_scale", L"general", L"ui_scale"},
 };
 
 bool ApplyFlatConfigJson(std::string_view body) {
@@ -632,6 +636,17 @@ input[type=checkbox]{width:18px;height:18px;accent-color:var(--accent);cursor:po
       std::string(R"HTML(
   <section class="card">
     <div class="card-title">常规与启动 [general] <span class="sub">修改后需重启 Chrome 生效</span></div>
+    <div class="row col">
+      <div class="label"><span class="t">紧凑顶栏 / 界面缩放 (ui_scale)</span><span class="d">压缩标签栏与地址栏高度（自动附加 --top-chrome-touch-ui=disabled 与 --force-device-scale-factor）。留空跟随系统 DPI；若网页变小，可在 Chrome 外观设置里将“页面缩放”调为 110%～125%</span></div>
+      <input type="text" id="general.ui_scale" placeholder="留空默认，例如 0.85 或 0.9">
+      <div class="presets">
+        <button type="button" class="preset" data-scale="">默认（跟随系统）</button>
+        <button type="button" class="preset" data-scale="0.9">紧凑 (0.9)</button>
+        <button type="button" class="preset" data-scale="0.85">更紧凑 (0.85)</button>
+        <button type="button" class="preset" data-scale="0.8">超紧凑 (0.8)</button>
+        <button type="button" class="preset" data-scale="1.0">1.0（覆盖系统高缩放）</button>
+      </div>
+    </div>
     <div class="row"><div class="label"><span class="t">老板键 (boss_key)</span><span class="d">例如 Ctrl+Alt+B</span></div><input type="text" id="general.boss_key"></div>
     <div class="row"><div class="label"><span class="t">网页翻译快捷键 (translate_key)</span><span class="d">例如 Alt+T</span></div><input type="text" id="general.translate_key"></div>
     <div class="row col"><div class="label"><span class="t">附加启动参数 (command_line)</span><span class="d">追加到 Chrome 启动命令行的参数</span></div><input type="text" id="general.command_line"></div>
@@ -663,7 +678,7 @@ const fields = [
   'tabs.hover_tab','tabs.hover_tab_delay','tabs.open_url_new_tab',
   'tabs.open_bookmark_new_tab','tabs.new_tab_disable','tabs.new_tab_disable_name',
   'proxy.enabled','proxy.server','proxy.bypass_list',
-  'general.boss_key','general.translate_key','general.command_line',
+  'general.ui_scale','general.boss_key','general.translate_key','general.command_line',
   'general.data_dir','general.cache_dir','general.launch_on_startup',
   'general.launch_on_exit','general.ignore_policies',
   'general.suppress_false_upgrade_notification','general.win32k'
@@ -714,8 +729,12 @@ $('saveBtn').addEventListener('click', saveConfig);
 $('reloadBtn').addEventListener('click', async () => { await loadConfig(); toast('已重新读取配置'); });
 document.querySelectorAll('.preset').forEach(btn => {
   btn.addEventListener('click', () => {
-    $('proxy.server').value = btn.dataset.proxy;
-    $('proxy.enabled').checked = true;
+    if (btn.dataset.proxy !== undefined) {
+      $('proxy.server').value = btn.dataset.proxy;
+      $('proxy.enabled').checked = true;
+    } else if (btn.dataset.scale !== undefined) {
+      $('general.ui_scale').value = btn.dataset.scale;
+    }
   });
 });
 loadConfig();
