@@ -10,5 +10,6 @@ void TabBookmark();
 // without modifying the system clipboard. When `background` is true, switches
 // back to the previously active tab right after submitting.
 void OpenInNewTab(HWND root, std::wstring text, bool background = false);
+POINT GetLastLButtonDownPoint();
 
 #endif  // CHROME_PLUS_SRC_TABBOOKMARK_H_

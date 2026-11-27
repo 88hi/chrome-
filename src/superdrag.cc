@@ -108,7 +108,12 @@ bool HasFileDrop(IDataObject* data_obj) {
   return data_obj->QueryGetData(&fmt) == S_OK;
 }
 
-std::optional<std::wstring> ExtractDragContent(IDataObject* data_obj) {
+struct DragContent {
+  std::wstring text;
+  bool is_link = false;
+};
+
+std::optional<DragContent> ExtractDragContent(IDataObject* data_obj) {
   if (!data_obj || HasFileDrop(data_obj)) {
     return std::nullopt;
   }
@@ -120,11 +125,48 @@ std::optional<std::wstring> ExtractDragContent(IDataObject* data_obj) {
       if (url->starts_with(L"javascript:") || url->starts_with(L"JAVASCRIPT:")) {
         return std::nullopt;
       }
-      return url;
+      return DragContent{std::move(*url), /*is_link=*/true};
     }
   }
 
-  return ReadHGlobalText(data_obj, CF_UNICODETEXT, /*is_url=*/false);
+  if (auto text = ReadHGlobalText(data_obj, CF_UNICODETEXT, /*is_url=*/false)) {
+    return DragContent{std::move(*text), /*is_link=*/false};
+  }
+  return std::nullopt;
+}
+
+bool SendMiddleClickAtAndRestore(POINT click_pt, POINT restore_pt) {
+  const int vx = ::GetSystemMetrics(SM_XVIRTUALSCREEN);
+  const int vy = ::GetSystemMetrics(SM_YVIRTUALSCREEN);
+  const int vw = ::GetSystemMetrics(SM_CXVIRTUALSCREEN);
+  const int vh = ::GetSystemMetrics(SM_CYVIRTUALSCREEN);
+  if (vw <= 1 || vh <= 1) {
+    return false;
+  }
+
+  auto make_move = [&](POINT pt) {
+    INPUT in{};
+    in.type = INPUT_MOUSE;
+    in.mi.dx = ::MulDiv(pt.x - vx, 65535, vw - 1);
+    in.mi.dy = ::MulDiv(pt.y - vy, 65535, vh - 1);
+    in.mi.dwFlags =
+        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+    in.mi.dwExtraInfo = GetMagicCode();
+    return in;
+  };
+
+  INPUT down{};
+  down.type = INPUT_MOUSE;
+  down.mi.dwFlags = MOUSEEVENTF_MIDDLEDOWN;
+  down.mi.dwExtraInfo = GetMagicCode();
+
+  INPUT up{};
+  up.type = INPUT_MOUSE;
+  up.mi.dwFlags = MOUSEEVENTF_MIDDLEUP;
+  up.mi.dwExtraInfo = GetMagicCode();
+
+  INPUT inputs[4] = {make_move(click_pt), down, up, make_move(restore_pt)};
+  return ::SendInput(4, inputs, sizeof(INPUT)) == 4;
 }
 
 HRESULT WINAPI MyDoDragDrop(LPDATAOBJECT pDataObj,
@@ -135,6 +177,7 @@ HRESULT WINAPI MyDoDragDrop(LPDATAOBJECT pDataObj,
   const bool has_start_pt = ::GetCursorPos(&start_pt) != FALSE;
   const HWND start_root =
       has_start_pt ? GetChromeRootWindowAt(start_pt) : nullptr;
+  const POINT down_pt = GetLastLButtonDownPoint();
 
   const HRESULT hr = RawDoDragDrop(pDataObj, pDropSource, dwOKEffects, pdwEffect);
 
@@ -174,7 +217,16 @@ HRESULT WINAPI MyDoDragDrop(LPDATAOBJECT pDataObj,
   }
 
   if (auto content = ExtractDragContent(pDataObj)) {
-    OpenInNewTab(start_root, std::move(*content), /*background=*/mode == 2);
+    // For dragged links in background mode, middle-clicking the original link
+    // coordinates opens the link in a background tab next to the current tab
+    // with zero omnibox or page flicker.
+    if (mode == 2 && content->is_link && down_pt.x >= 0 && down_pt.y >= 0 &&
+        GetChromeRootWindowAt(down_pt) == start_root && !IsOnTabBar(down_pt) &&
+        SendMiddleClickAtAndRestore(down_pt, drop_pt)) {
+      return hr;
+    }
+    OpenInNewTab(start_root, std::move(content->text),
+                 /*background=*/mode == 2);
   }
 
   return hr;

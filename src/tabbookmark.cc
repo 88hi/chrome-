@@ -399,10 +399,30 @@ void CALLBACK ClipboardNewTabTimerProc(HWND hwnd,
     }
 
     if (clipboard_new_tab_text.has_value()) {
-      if (!SetOmniboxText(*clipboard_new_tab_text)) {
+      const bool set_sync = SetOmniboxText(*clipboard_new_tab_text);
+      if (!set_sync) {
         SendUnicodeText(*clipboard_new_tab_text);
       }
       clipboard_new_tab_text.reset();
+
+      // `SetOmniboxText` updates the omnibox synchronously, so we can submit
+      // and revert in the same tick without waiting for extra timer frames
+      // (eliminating the visible omnibox dropdown flicker).
+      if (set_sync &&
+          clipboard_new_tab_mode == NewTabNavMode::kOmniboxBackground) {
+        CancelClipboardNewTabTimer();
+        suppress_next_open_url_new_tab = true;
+        SendKey({VK_SHIFT, VK_MENU, VK_RETURN});
+        SendKey({VK_ESCAPE});
+        return;
+      }
+      if (set_sync &&
+          clipboard_new_tab_mode == NewTabNavMode::kOmniboxForeground) {
+        CancelClipboardNewTabTimer();
+        suppress_next_open_url_new_tab = true;
+        SendKey({VK_MENU, VK_RETURN});
+        return;
+      }
     } else {
       SendKey({VK_CONTROL, 'V'});
     }
@@ -833,4 +853,8 @@ void OpenInNewTab(HWND root, std::wstring text, bool background) {
   StartNewTabNavigation(root, std::move(text),
                         background ? NewTabNavMode::kOmniboxBackground
                                    : NewTabNavMode::kOmniboxForeground);
+}
+
+POINT GetLastLButtonDownPoint() {
+  return lbutton_down_point;
 }
