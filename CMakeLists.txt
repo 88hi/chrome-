@@ -92,6 +92,7 @@ option(
 add_compile_definitions(
   UNICODE
   _UNICODE
+  NOMINMAX
   $<$<CONFIG:Debug>:_DEBUG>
 )
 
