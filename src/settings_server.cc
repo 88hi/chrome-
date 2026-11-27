@@ -24,11 +24,10 @@
 
 namespace {
 
-constexpr wchar_t kSettingsUrlEnv[] = L"CHROME_PLUS_SETTINGS_URL";
+constexpr uint16_t kSettingsPort = 48321;
+constexpr std::string_view kExpectedHost = "127.0.0.1:48321";
 
-std::string g_settings_url;
 std::string g_session_token;
-std::string g_expected_host;
 
 std::string WideToUtf8(std::wstring_view wide) {
   if (wide.empty()) {
@@ -62,11 +61,11 @@ std::wstring Utf8ToWide(std::string_view utf8) {
 }
 
 std::string GenerateSessionToken() {
-  std::array<uint8_t, 4> bytes{};
+  std::array<uint8_t, 8> bytes{};
   if (::BCryptGenRandom(nullptr, bytes.data(), static_cast<ULONG>(bytes.size()),
                         BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
-    const uint32_t fallback =
-        static_cast<uint32_t>(::GetTickCount64()) ^ ::GetCurrentProcessId();
+    const uint64_t fallback =
+        (::GetTickCount64() << 16) ^ static_cast<uint64_t>(::GetCurrentProcessId());
     memcpy(bytes.data(), &fallback, sizeof(fallback));
   }
   constexpr char kHex[] = "0123456789abcdef";
@@ -649,8 +648,7 @@ input[type=checkbox]{width:18px;height:18px;accent-color:var(--accent);cursor:po
 </main>
 <div id="toast"></div>
 <script>
-const sp = new URLSearchParams(location.search);
-const token = sp.get('t') || sp.get('token') || '';
+const token = '__CHROME_PLUS_TOKEN__';
 const $ = id => document.getElementById(id);
 const toast = msg => {
   const el = $('toast');
@@ -672,7 +670,9 @@ const fields = [
 ];
 async function loadConfig() {
   try {
-    const res = await fetch('/api/config?token=' + encodeURIComponent(token));
+    const res = await fetch('/api/config', {
+      headers: {'X-Chrome-Plus-Token': token}
+    });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
     $('ver').textContent = 'v' + (data.version || '');
@@ -794,30 +794,6 @@ std::string_view GetHeaderValue(std::string_view headers,
   return {};
 }
 
-std::string_view ExtractQueryToken(std::string_view target) {
-  const size_t q = target.find('?');
-  if (q == std::string_view::npos) {
-    return {};
-  }
-  std::string_view query = target.substr(q + 1);
-  while (!query.empty()) {
-    const size_t amp = query.find('&');
-    const std::string_view part =
-        amp == std::string_view::npos ? query : query.substr(0, amp);
-    if (part.starts_with("t=")) {
-      return part.substr(2);
-    }
-    if (part.starts_with("token=")) {
-      return part.substr(6);
-    }
-    if (amp == std::string_view::npos) {
-      break;
-    }
-    query.remove_prefix(amp + 1);
-  }
-  return {};
-}
-
 void HandleClient(SOCKET client) {
   constexpr DWORD kTimeoutMs = 3000;
   ::setsockopt(client, SOL_SOCKET, SO_RCVTIMEO,
@@ -873,7 +849,7 @@ void HandleClient(SOCKET client) {
 
   // Guard against DNS rebinding.
   const std::string_view host = GetHeaderValue(headers, "Host");
-  if (host != g_expected_host) {
+  if (host != kExpectedHost) {
     SendHttpResponse(client, "403 Forbidden", "text/plain; charset=utf-8",
                      "Forbidden");
     ::closesocket(client);
@@ -897,15 +873,11 @@ void HandleClient(SOCKET client) {
       q == std::string_view::npos ? target : target.substr(0, q);
 
   if (method == "GET" && path == "/") {
-    if (ExtractQueryToken(target) != g_session_token) {
-      SendHttpResponse(client, "403 Forbidden", "text/plain; charset=utf-8",
-                       "Invalid token");
-    } else {
-      SendHttpResponse(client, "200 OK", "text/html; charset=utf-8",
-                       GetSettingsHtml());
-    }
+    std::string html = GetSettingsHtml();
+    ReplaceStringInPlace(html, "__CHROME_PLUS_TOKEN__", g_session_token);
+    SendHttpResponse(client, "200 OK", "text/html; charset=utf-8", html);
   } else if (method == "GET" && path == "/api/config") {
-    if (ExtractQueryToken(target) != g_session_token) {
+    if (GetHeaderValue(headers, "X-Chrome-Plus-Token") != g_session_token) {
       SendHttpResponse(client, "403 Forbidden", "application/json",
                        R"({"error":"forbidden"})");
     } else {
@@ -951,17 +923,10 @@ void StartSettingsServer() {
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  addr.sin_port = 0;
+  addr.sin_port = htons(kSettingsPort);
 
   if (::bind(listen_sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) ==
       SOCKET_ERROR) {
-    ::closesocket(listen_sock);
-    return;
-  }
-
-  int addr_len = sizeof(addr);
-  if (::getsockname(listen_sock, reinterpret_cast<sockaddr*>(&addr),
-                    &addr_len) == SOCKET_ERROR) {
     ::closesocket(listen_sock);
     return;
   }
@@ -971,13 +936,8 @@ void StartSettingsServer() {
     return;
   }
 
-  const uint16_t port = ntohs(addr.sin_port);
   g_session_token = GenerateSessionToken();
-  g_expected_host = "127.0.0.1:" + std::to_string(port);
-  g_settings_url = "http://" + g_expected_host + "/?t=" + g_session_token;
-  ::SetEnvironmentVariableW(kSettingsUrlEnv, Utf8ToWide(g_settings_url).c_str());
-
-  DebugLog(L"SettingsServer: listening on {}", Utf8ToWide(g_settings_url));
+  DebugLog(L"SettingsServer: listening on http://127.0.0.1:{}", kSettingsPort);
 
   std::thread([listen_sock] {
     while (true) {
@@ -989,16 +949,4 @@ void StartSettingsServer() {
     }
     ::closesocket(listen_sock);
   }).detach();
-}
-
-const std::string& GetSettingsServerUrl() {
-  if (g_settings_url.empty()) {
-    wchar_t value[128] = {};
-    const DWORD len =
-        ::GetEnvironmentVariableW(kSettingsUrlEnv, value, ARRAYSIZE(value));
-    if (len > 0 && len < ARRAYSIZE(value)) {
-      g_settings_url = WideToUtf8(std::wstring_view(value, len));
-    }
-  }
-  return g_settings_url;
 }

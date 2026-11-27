@@ -211,18 +211,30 @@ bool PatchSettingsHtml(uint8_t* begin, uint32_t size, size_t& new_len) {
   ReplaceStringInPlace(html, R"(?hidden="${!this.shouldShowIcons_()}")",
                        R"(hidden="true")");
 
-  std::string product_title =
-      R"({aboutBrowserVersion}</div><div class="secondary">Powered by )";
-  if (const std::string& settings_url = GetSettingsServerUrl();
-      !settings_url.empty()) {
-    product_title += R"(<a target="_blank" href=")" + settings_url +
-                     R"(">Chrome++ 设置</a> )";
-  } else {
-    product_title +=
-        R"(<a target="_blank" href="https://github.com/Bush2021/chrome_plus">Chrome++ Next</a> )";
-  }
-  product_title += RELEASE_VER_STR BUILD_ARCH R"(</div>)";
+  const std::string settings_url(GetSettingsServerUrl());
+  const std::string product_title =
+      R"({aboutBrowserVersion}</div><div class="secondary">Powered by <a target="_blank" href=")" +
+      settings_url + R"(">Chrome++ 设置</a> )" RELEASE_VER_STR BUILD_ARCH
+      R"(</div>)";
   ReplaceStringInPlace(html, R"({aboutBrowserVersion}</div>)", product_title);
+
+  // Also inject a native-looking menu item into the chrome://settings left
+  // sidebar right above the Extensions link.
+  size_t ext_pos = html.find(R"(id="extensionsLink")");
+  if (ext_pos == std::string::npos) {
+    ext_pos = html.find(R"(href="chrome://extensions")");
+  }
+  if (ext_pos != std::string::npos) {
+    const size_t search_from = ext_pos > 300 ? ext_pos - 300 : 0;
+    const size_t anchor_pos = html.rfind("<a ", ext_pos);
+    if (anchor_pos != std::string::npos && anchor_pos >= search_from) {
+      const std::string sidebar_item =
+          R"(<a role="menuitem" class="cr-nav-menu-item" href=")" +
+          settings_url +
+          R"(" target="_blank"><cr-icon icon="cr:settings"></cr-icon>Chrome++ 设置<cr-icon icon="cr:open-in-new"></cr-icon></a>)";
+      html.insert(anchor_pos, sidebar_item);
+    }
+  }
 
   if (html.length() > size) {
     return false;
@@ -278,7 +290,7 @@ struct PakCacheHeader {
   uint64_t entry_hash;
 };
 
-constexpr uint32_t kPakCacheMagic = 0x43505043;
+constexpr uint32_t kPakCacheMagic = 0x43505044;
 constexpr wchar_t kPakCacheName[] = L"Chrome++_PakCache.bin";
 // The patched bytes embed the build's version and architecture.
 constexpr char kPatchBuild[] = RELEASE_VER_STR BUILD_ARCH;
@@ -459,9 +471,8 @@ void PatchResourcesPak(uint8_t* buffer) {
   std::optional<uint16_t> cached_id;
   uint16_t cached_hint_id = 0;
   if (is_browser && resources_pak_identity) {
-    const bool has_dynamic_url = !GetSettingsServerUrl().empty();
     cached_id = ApplyCachedResult(buffer, *resources_pak_identity,
-                                  has_dynamic_url, &cached_hint_id);
+                                  /*skip_bytes=*/false, &cached_hint_id);
   }
   uint16_t matched_id = 0;
   if (cached_id) {
