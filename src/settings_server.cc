@@ -218,7 +218,7 @@ std::string BuildConfigJson() {
   AppendJsonField(json, "new_tab_disable",
                   GetIniInt(L"tabs", L"new_tab_disable", 1) != 0, first);
   AppendJsonField(json, "super_drag",
-                  GetIniInt(L"tabs", L"super_drag", 1) != 0, first);
+                  GetIniInt(L"tabs", L"super_drag", 2), first);
   AppendJsonField(
       json, "new_tab_disable_name",
       WideToUtf8(GetIniString(L"tabs", L"new_tab_disable_name", L"")), first);
@@ -465,7 +465,7 @@ constexpr AllowedIniKey kAllowedKeys[] = {
     {"tabs.open_bookmark_new_tab", L"tabs", L"open_bookmark_new_tab", true, 0,
      2},
     {"tabs.new_tab_disable", L"tabs", L"new_tab_disable", true, 0, 1},
-    {"tabs.super_drag", L"tabs", L"super_drag", true, 0, 1},
+    {"tabs.super_drag", L"tabs", L"super_drag", true, 0, 2},
     {"tabs.new_tab_disable_name", L"tabs", L"new_tab_disable_name"},
     // proxy
     {"proxy.enabled", L"proxy", L"enabled", true, 0, 1},
@@ -632,7 +632,7 @@ input[type=checkbox]{width:18px;height:18px;accent-color:var(--accent);cursor:po
     <div class="row"><div class="label"><span class="t">悬停激活延迟（毫秒）</span><span class="d">hover_tab_delay（0 - 5000）</span></div><input type="number" id="tabs.hover_tab_delay" min="0" max="5000" step="50"></div>
     <div class="row"><div class="label"><span class="t">地址栏输入在新标签页打开</span><span class="d">open_url_new_tab</span></div><select id="tabs.open_url_new_tab"><option value="0">关闭</option><option value="1">前台新标签页</option><option value="2">后台新标签页</option></select></div>
     <div class="row"><div class="label"><span class="t">书签在新标签页打开</span><span class="d">open_bookmark_new_tab</span></div><select id="tabs.open_bookmark_new_tab"><option value="0">关闭</option><option value="1">前台新标签页</option><option value="2">后台新标签页</option></select></div>
-    <div class="row"><div class="label"><span class="t">超级拖拽（拖拽文字搜索 / 拖拽链接新标签页打开）</span><span class="d">super_drag（拖入输入框或按 Esc 可正常取消/放置）</span></div><input type="checkbox" id="tabs.super_drag"></div>
+    <div class="row"><div class="label"><span class="t">超级拖拽（拖拽文字搜索 / 拖拽链接打开）</span><span class="d">super_drag（拖入输入框或按 Esc 可正常取消/放置）</span></div><select id="tabs.super_drag"><option value="0">关闭</option><option value="1">前台新标签页</option><option value="2">后台新标签页（不切换）</option></select></div>
     <div class="row"><div class="label"><span class="t">当前为新标签页时禁用上述两项</span><span class="d">new_tab_disable</span></div><input type="checkbox" id="tabs.new_tab_disable"></div>
     <div class="row col"><div class="label"><span class="t">额外新标签页标题列表</span><span class="d">new_tab_disable_name（用引号包裹、逗号分隔，修改后重启生效）</span></div><input type="text" id="tabs.new_tab_disable_name"></div>
   </section>

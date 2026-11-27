@@ -7,7 +7,8 @@
 
 void TabBookmark();
 // Opens a new tab in `root` and navigates/searches `text` via the omnibox
-// without modifying the system clipboard.
-void OpenInNewTab(HWND root, std::wstring text);
+// without modifying the system clipboard. When `background` is true, switches
+// back to the previously active tab right after submitting.
+void OpenInNewTab(HWND root, std::wstring text, bool background = false);
 
 #endif  // CHROME_PLUS_SRC_TABBOOKMARK_H_

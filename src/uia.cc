@@ -1150,14 +1150,14 @@ std::optional<TabHitResult> FindTabHitResult(POINT pt,
                            need_close_button);
 }
 
-bool SelectTab(const TabHitResult& hit_result) {
-  if (!hit_result.tab) {
+bool SelectTab(const ComPtr<IUIAutomationElement>& tab) {
+  if (!tab) {
     return false;
   }
 
   ComPtr<IUnknown> pattern;
-  HRESULT hr = hit_result.tab->GetCurrentPattern(
-      UIA_SelectionItemPatternId, pattern.ReleaseAndGetAddressOf());
+  HRESULT hr = tab->GetCurrentPattern(UIA_SelectionItemPatternId,
+                                      pattern.ReleaseAndGetAddressOf());
   if (FAILED(hr) || !pattern) {
     DebugLog(L"UIA: tab selection item pattern unavailable");
     return false;
@@ -1182,6 +1182,25 @@ bool SelectTab(const TabHitResult& hit_result) {
     return false;
   }
   return true;
+}
+
+bool SelectTab(const TabHitResult& hit_result) {
+  return SelectTab(hit_result.tab);
+}
+
+ComPtr<IUIAutomationElement> FindSelectedTab(HWND hwnd) {
+  UiaSession* session = GetUiaSession();
+  if (!session || !hwnd) {
+    return nullptr;
+  }
+
+  RECT region_rect;
+  TabUiCache* ui = GetValidatedTabUi(session, hwnd, &region_rect);
+  if (!ui) {
+    return nullptr;
+  }
+
+  return FindSelectedTabElement(*session, ui->container);
 }
 
 std::optional<int> FindTabCount(HWND hwnd) {

@@ -19,6 +19,9 @@ FindTabHitResult(POINT pt, bool need_count, bool need_close_button);
 // Deliberately not [[nodiscard]]: the caller has no fallback action;
 // failures are logged at the failure site.
 bool SelectTab(const TabHitResult& hit_result);
+bool SelectTab(const Microsoft::WRL::ComPtr<IUIAutomationElement>& tab);
+[[nodiscard]] Microsoft::WRL::ComPtr<IUIAutomationElement> FindSelectedTab(
+    HWND hwnd);
 [[nodiscard]] std::optional<int> FindTabCount(HWND hwnd);
 [[nodiscard]] bool IsOnTabBar(POINT pt);
 [[nodiscard]] bool IsOnNewTabButton(POINT pt);

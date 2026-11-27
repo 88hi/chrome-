@@ -40,18 +40,21 @@ std::optional<POINT> wheel_switch_point;
 constexpr UINT_PTR kClipboardNewTabTimerId = 0x636C4E54;  // 'clNT'
 constexpr UINT kClipboardNewTabPollMs = 20;
 constexpr UINT kClipboardNewTabSubmitDelayMs = 30;
+constexpr UINT kClipboardNewTabRestoreDelayMs = 25;
 constexpr int kClipboardNewTabMaxPolls = 25;
 
 enum class ClipboardNewTabStage {
   kIdle,
   kWaitingForNewTab,
   kWaitingToSubmit,
+  kWaitingToRestoreTab,
 };
 
 HWND clipboard_new_tab_root = nullptr;
 ClipboardNewTabStage clipboard_new_tab_stage = ClipboardNewTabStage::kIdle;
 std::optional<int> clipboard_new_tab_initial_count;
 std::optional<std::wstring> clipboard_new_tab_text;
+Microsoft::WRL::ComPtr<IUIAutomationElement> clipboard_new_tab_previous_tab;
 int clipboard_new_tab_polls = 0;
 bool suppress_next_open_url_new_tab = false;
 
@@ -356,6 +359,7 @@ void CancelClipboardNewTabTimer() {
   clipboard_new_tab_stage = ClipboardNewTabStage::kIdle;
   clipboard_new_tab_initial_count.reset();
   clipboard_new_tab_text.reset();
+  clipboard_new_tab_previous_tab.Reset();
   clipboard_new_tab_polls = 0;
 }
 
@@ -404,17 +408,40 @@ void CALLBACK ClipboardNewTabTimerProc(HWND hwnd,
     return;
   }
 
-  // `kWaitingToSubmit`: submit the pasted/set URL or search query in the
-  // omnibox.
-  CancelClipboardNewTabTimer();
-  if (!IsOmniboxFocused()) {
+  if (clipboard_new_tab_stage == ClipboardNewTabStage::kWaitingToSubmit) {
+    if (!IsOmniboxFocused()) {
+      CancelClipboardNewTabTimer();
+      return;
+    }
+    suppress_next_open_url_new_tab = true;
+    SendKey({VK_RETURN});
+
+    if (clipboard_new_tab_previous_tab) {
+      clipboard_new_tab_stage = ClipboardNewTabStage::kWaitingToRestoreTab;
+      if (!SetTimer(hwnd, kClipboardNewTabTimerId,
+                    kClipboardNewTabRestoreDelayMs,
+                    ClipboardNewTabTimerProc)) {
+        CancelClipboardNewTabTimer();
+      }
+      return;
+    }
+
+    CancelClipboardNewTabTimer();
     return;
   }
-  suppress_next_open_url_new_tab = true;
-  SendKey({VK_RETURN});
+
+  // `kWaitingToRestoreTab`: return to the previously active tab so the new
+  // search/link loads in the background.
+  const auto previous_tab = clipboard_new_tab_previous_tab;
+  CancelClipboardNewTabTimer();
+  if (previous_tab) {
+    SelectTab(previous_tab);
+  }
 }
 
-void StartNewTabNavigation(HWND root, std::optional<std::wstring> text) {
+void StartNewTabNavigation(HWND root,
+                           std::optional<std::wstring> text,
+                           bool background) {
   if (!root) {
     return;
   }
@@ -422,6 +449,8 @@ void StartNewTabNavigation(HWND root, std::optional<std::wstring> text) {
   CancelClipboardNewTabTimer();
   clipboard_new_tab_initial_count = FindTabCount(root);
   clipboard_new_tab_text = std::move(text);
+  clipboard_new_tab_previous_tab =
+      background ? FindSelectedTab(root) : nullptr;
   clipboard_new_tab_polls = 0;
   clipboard_new_tab_stage = ClipboardNewTabStage::kWaitingForNewTab;
 
@@ -451,7 +480,7 @@ bool HandleRightClickNewTabButton(const MOUSEHOOKSTRUCT* pmouse) {
     return false;
   }
 
-  StartNewTabNavigation(root, std::nullopt);
+  StartNewTabNavigation(root, std::nullopt, /*background=*/false);
   return true;
 }
 
@@ -780,9 +809,9 @@ void TabBookmark() {
   RegisterKeyboardHandler(TabBookmarkKeyboardHandler, HandlerPriority::kNormal);
 }
 
-void OpenInNewTab(HWND root, std::wstring text) {
+void OpenInNewTab(HWND root, std::wstring text, bool background) {
   if (!root || text.empty()) {
     return;
   }
-  StartNewTabNavigation(root, std::move(text));
+  StartNewTabNavigation(root, std::move(text), background);
 }

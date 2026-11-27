@@ -138,7 +138,8 @@ HRESULT WINAPI MyDoDragDrop(LPDATAOBJECT pDataObj,
 
   const HRESULT hr = RawDoDragDrop(pDataObj, pDropSource, dwOKEffects, pdwEffect);
 
-  if (!config.IsSuperDrag() || !pDataObj || !start_root) {
+  const int mode = config.GetSuperDragMode();
+  if (mode == 0 || !pDataObj || !start_root) {
     return hr;
   }
 
@@ -173,7 +174,7 @@ HRESULT WINAPI MyDoDragDrop(LPDATAOBJECT pDataObj,
   }
 
   if (auto content = ExtractDragContent(pDataObj)) {
-    OpenInNewTab(start_root, std::move(*content));
+    OpenInNewTab(start_root, std::move(*content), /*background=*/mode == 2);
   }
 
   return hr;
