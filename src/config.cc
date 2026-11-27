@@ -36,11 +36,13 @@ void Config::LoadConfig() {
   // tabs
   keep_last_tab_ = GetIniInt(L"tabs", L"keep_last_tab", 1) != 0;
   double_click_close_ = GetIniInt(L"tabs", L"double_click_close", 1) != 0;
-  right_click_close_ = GetIniInt(L"tabs", L"right_click_close", 0) != 0;
+  right_click_close_ = GetIniInt(L"tabs", L"right_click_close", 1) != 0;
+  right_click_new_tab_clipboard_ =
+      GetIniInt(L"tabs", L"right_click_new_tab_clipboard", 1) != 0;
   wheel_tab_ = GetIniInt(L"tabs", L"wheel_tab", 1) != 0;
   wheel_tab_when_press_rbutton_ =
       GetIniInt(L"tabs", L"wheel_tab_when_press_rbutton", 1) != 0;
-  hover_tab_ = GetIniInt(L"tabs", L"hover_tab", 0) != 0;
+  hover_tab_ = GetIniInt(L"tabs", L"hover_tab", 1) != 0;
   hover_tab_delay_ = LoadHoverTabDelay();
   open_url_new_tab_ = GetIniInt(L"tabs", L"open_url_new_tab", 0);
   bookmark_new_tab_ = GetIniInt(L"tabs", L"open_bookmark_new_tab", 0);

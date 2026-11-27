@@ -44,6 +44,7 @@ struct CachedClassConditions {
   ComPtr<IUIAutomationCondition> bookmark_button;
   ComPtr<IUIAutomationCondition> menu_item_view;
   ComPtr<IUIAutomationCondition> tab_strip_control_button;
+  ComPtr<IUIAutomationCondition> new_tab_button;
 };
 
 enum class TabContainerKind {
@@ -144,6 +145,18 @@ bool InitializeClassConditions(UiaSession* session) {
     return false;
   }
 
+  ComPtr<IUIAutomationCondition> legacy_new_tab_button;
+  if (!CreateClassCondition(session->automation, L"TabStripControlButton",
+                            &conditions.tab_strip_control_button) ||
+      !CreateClassCondition(session->automation, L"NewTabButton",
+                            &legacy_new_tab_button) ||
+      FAILED(session->automation->CreateOrCondition(
+          conditions.tab_strip_control_button.Get(),
+          legacy_new_tab_button.Get(),
+          conditions.new_tab_button.ReleaseAndGetAddressOf()))) {
+    return false;
+  }
+
   return CreateClassCondition(session->automation,
                               L"TabStrip::TabDragContextImpl",
                               &conditions.tab_strip_drag_context) &&
@@ -157,9 +170,7 @@ bool InitializeClassConditions(UiaSession* session) {
          CreateClassCondition(session->automation, L"BookmarkButton",
                               &conditions.bookmark_button) &&
          CreateClassCondition(session->automation, L"MenuItemView",
-                              &conditions.menu_item_view) &&
-         CreateClassCondition(session->automation, L"TabStripControlButton",
-                              &conditions.tab_strip_control_button);
+                              &conditions.menu_item_view);
 }
 
 UiaSession* GetUiaSession() {
@@ -1221,6 +1232,46 @@ bool IsOnTabBar(POINT pt) {
   }
 
   return PtInRect(&region_rect, pt) != FALSE;
+}
+
+bool IsOnNewTabButton(POINT pt) {
+  UiaSession* session = GetUiaSession();
+  if (!session) {
+    return false;
+  }
+
+  const HWND root = GetChromeRootWindowAt(pt);
+  if (!root) {
+    return false;
+  }
+
+  RECT region_rect;
+  TabUiCache* ui = GetValidatedTabUi(session, root, &region_rect);
+  if (!ui || !PtInRect(&region_rect, pt)) {
+    return false;
+  }
+
+  ComPtr<IUIAutomationElementArray> buttons;
+  if (ui->region) {
+    if (FAILED(ui->region->FindAll(
+            TreeScope_Subtree, session->class_conditions.new_tab_button.Get(),
+            buttons.ReleaseAndGetAddressOf()))) {
+      return false;
+    }
+  } else if (const auto region = FindRawTabStripRegionAncestor(
+                 *session, ui->container.element)) {
+    if (FAILED(region->FindAllBuildCache(
+            TreeScope_Subtree, session->class_conditions.new_tab_button.Get(),
+            session->raw_view_request.Get(),
+            buttons.ReleaseAndGetAddressOf()))) {
+      return false;
+    }
+  }
+
+  return FindFirstInArray(buttons,
+                          [pt](const ComPtr<IUIAutomationElement>& button) {
+                            return ContainsPoint(button, pt);
+                          }) != nullptr;
 }
 
 bool IsOnBookmark(POINT pt) {

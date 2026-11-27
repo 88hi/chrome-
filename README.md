@@ -37,6 +37,7 @@ Use [Pitstop](https://github.com/Bush2021/pitstop) to set up Chrome and Chrome++
 ### Tab and bookmark behavior
 - Double-click to close tabs.
 - Right-click to close tabs, with `Shift` preserving the original menu.
+- Right-click the New Tab (`+`) button to open clipboard text as a URL or search query in a new tab, with `Shift` preserving the original menu.
 - Keep the last tab from closing the browser window.
 - Switch tabs with the mouse wheel over the tab strip.
 - Switch tabs with the mouse wheel while holding the right mouse button.

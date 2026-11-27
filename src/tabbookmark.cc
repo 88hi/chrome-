@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <cstdlib>
+#include <cwctype>
 #include <optional>
 
 #include "config.h"
@@ -32,6 +33,23 @@ std::optional<POINT> last_hover_move_point;
 // reverting the switch the user just made. Cleared once the cursor travels
 // beyond the jitter threshold.
 std::optional<POINT> wheel_switch_point;
+
+constexpr UINT_PTR kClipboardNewTabTimerId = 0x636C4E54;  // 'clNT'
+constexpr UINT kClipboardNewTabPollMs = 20;
+constexpr UINT kClipboardNewTabSubmitDelayMs = 30;
+constexpr int kClipboardNewTabMaxPolls = 25;
+
+enum class ClipboardNewTabStage {
+  kIdle,
+  kWaitingForNewTab,
+  kWaitingToSubmit,
+};
+
+HWND clipboard_new_tab_root = nullptr;
+ClipboardNewTabStage clipboard_new_tab_stage = ClipboardNewTabStage::kIdle;
+std::optional<int> clipboard_new_tab_initial_count;
+int clipboard_new_tab_polls = 0;
+bool suppress_next_open_url_new_tab = false;
 
 enum class KeepTabTrigger {
   kRightClick = 0,
@@ -281,6 +299,119 @@ bool HandleRightClick(const MOUSEHOOKSTRUCT* pmouse) {
   return true;
 }
 
+bool HasClipboardText() {
+  if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+    return false;
+  }
+  if (!OpenClipboard(nullptr)) {
+    return false;
+  }
+
+  bool has_text = false;
+  if (HANDLE data = GetClipboardData(CF_UNICODETEXT)) {
+    if (const auto* text = static_cast<const wchar_t*>(GlobalLock(data))) {
+      for (const wchar_t* p = text; *p != L'\0'; ++p) {
+        if (!std::iswspace(*p)) {
+          has_text = true;
+          break;
+        }
+      }
+      GlobalUnlock(data);
+    }
+  }
+  CloseClipboard();
+  return has_text;
+}
+
+void CancelClipboardNewTabTimer() {
+  if (clipboard_new_tab_root) {
+    KillTimer(clipboard_new_tab_root, kClipboardNewTabTimerId);
+    clipboard_new_tab_root = nullptr;
+  }
+  clipboard_new_tab_stage = ClipboardNewTabStage::kIdle;
+  clipboard_new_tab_initial_count.reset();
+  clipboard_new_tab_polls = 0;
+}
+
+void CALLBACK ClipboardNewTabTimerProc(HWND hwnd,
+                                       UINT,
+                                       UINT_PTR event_id,
+                                       DWORD) {
+  if (clipboard_new_tab_root != hwnd ||
+      clipboard_new_tab_stage == ClipboardNewTabStage::kIdle) {
+    KillTimer(hwnd, event_id);
+    return;
+  }
+
+  if (GetForegroundWindow() != hwnd) {
+    CancelClipboardNewTabTimer();
+    return;
+  }
+
+  if (clipboard_new_tab_stage == ClipboardNewTabStage::kWaitingForNewTab) {
+    bool ready = IsOmniboxFocused();
+    if (ready && clipboard_new_tab_initial_count.has_value()) {
+      const auto current_count = FindTabCount(hwnd);
+      ready = current_count && *current_count > *clipboard_new_tab_initial_count;
+    }
+
+    if (!ready) {
+      if (++clipboard_new_tab_polls >= kClipboardNewTabMaxPolls) {
+        CancelClipboardNewTabTimer();
+      }
+      return;
+    }
+
+    SendKey({VK_CONTROL, 'V'});
+    clipboard_new_tab_stage = ClipboardNewTabStage::kWaitingToSubmit;
+    if (!SetTimer(hwnd, kClipboardNewTabTimerId, kClipboardNewTabSubmitDelayMs,
+                  ClipboardNewTabTimerProc)) {
+      CancelClipboardNewTabTimer();
+    }
+    return;
+  }
+
+  // `kWaitingToSubmit`: submit the pasted URL or search query in the omnibox.
+  CancelClipboardNewTabTimer();
+  if (!IsOmniboxFocused()) {
+    return;
+  }
+  suppress_next_open_url_new_tab = true;
+  SendKey({VK_RETURN});
+}
+
+// Right-click the New Tab (+) button to open clipboard text as a URL or search
+// query in a new tab (Hold Shift to show the original menu).
+bool HandleRightClickNewTabButton(const MOUSEHOOKSTRUCT* pmouse) {
+  if (IsKeyPressed(VK_SHIFT) || !config.IsRightClickNewTabClipboard()) {
+    return false;
+  }
+
+  const POINT pt = pmouse->pt;
+  if (!IsOnNewTabButton(pt) || !HasClipboardText()) {
+    return false;
+  }
+
+  const HWND root = GetChromeRootWindowAt(pt);
+  if (!root) {
+    return false;
+  }
+
+  CancelClipboardNewTabTimer();
+  clipboard_new_tab_initial_count = FindTabCount(root);
+  clipboard_new_tab_polls = 0;
+  clipboard_new_tab_stage = ClipboardNewTabStage::kWaitingForNewTab;
+
+  ExecuteCommand(IDC_NEW_TAB, root);
+  if (SetTimer(root, kClipboardNewTabTimerId, kClipboardNewTabPollMs,
+               ClipboardNewTabTimerProc)) {
+    clipboard_new_tab_root = root;
+  } else {
+    CancelClipboardNewTabTimer();
+  }
+  return true;
+}
+
 // Preserve the last tab when the middle button is clicked on the tab.
 bool HandleMiddleClick(const MOUSEHOOKSTRUCT* pmouse) {
   if (!config.IsKeepLastTab()) {
@@ -400,6 +531,7 @@ bool TabBookmarkMouseHandler(WPARAM wParam, LPARAM lParam) {
     case WM_LBUTTONDOWN:
     case WM_NCLBUTTONDOWN:
       CancelHoverTabTimer();
+      CancelClipboardNewTabTimer();
       closing_tab_by_dblclk = false;
       last_lbutton_down_on_tab = false;
       if (wParam == WM_LBUTTONDOWN) {
@@ -416,11 +548,13 @@ bool TabBookmarkMouseHandler(WPARAM wParam, LPARAM lParam) {
     case WM_MBUTTONDOWN:
     case WM_NCMBUTTONDOWN:
       CancelHoverTabTimer();
+      CancelClipboardNewTabTimer();
       closing_tab_by_middle = false;
       return false;
     case WM_RBUTTONDOWN:
     case WM_NCRBUTTONDOWN:
       CancelHoverTabTimer();
+      CancelClipboardNewTabTimer();
       closing_tab_by_right = false;
       return false;
     case WM_LBUTTONUP:
@@ -452,7 +586,8 @@ bool TabBookmarkMouseHandler(WPARAM wParam, LPARAM lParam) {
         // WM_MOUSEWHEEL.
         wheel_tab_ing_with_rbutton = false;
         return true;
-      } else if (HandleRightClick(pmouse)) {
+      } else if (HandleRightClick(pmouse) ||
+                 HandleRightClickNewTabButton(pmouse)) {
         closing_tab_by_right = true;
         return true;
       }
@@ -546,6 +681,11 @@ bool HandleKeepTab(WPARAM wParam) {
 }
 
 bool HandleOpenUrlNewTab(WPARAM wParam) {
+  if (wParam == VK_RETURN && suppress_next_open_url_new_tab) {
+    suppress_next_open_url_new_tab = false;
+    return false;
+  }
+
   int mode = config.GetOpenUrlNewTabMode();
   if (mode == 0 || wParam != VK_RETURN || IsKeyPressed(VK_MENU)) {
     return false;
