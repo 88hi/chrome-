@@ -233,6 +233,7 @@ struct PopupWindow {
   int level = 0;
   int parent_item_index = -1;
   std::wstring folder_id = L"__bookmark_bar__";
+  std::wstring folder_guid;
   BookmarkSource folder_source = BookmarkSource::kLocal;
   UINT dpi = kDefaultDpi;
 
@@ -1031,18 +1032,29 @@ void ExecuteBookmarkClick(PopupWindow* win, int index, bool background) {
   OpenInNewTab(root, std::move(url), background);
 }
 
+bool SameFolderNode(const BookmarkNode& n,
+                    const std::wstring& folder_id,
+                    const std::wstring& folder_guid) {
+  if (!n.is_folder) {
+    return false;
+  }
+  if (!folder_guid.empty() && !n.guid.empty()) {
+    return n.guid == folder_guid;
+  }
+  return !folder_id.empty() && n.id == folder_id;
+}
+
 const BookmarkNode* FindFolderNodeRecursive(
     const std::vector<BookmarkNode>& nodes,
-    BookmarkSource source,
-    const std::wstring& folder_id) {
+    const std::wstring& folder_id,
+    const std::wstring& folder_guid) {
   for (const auto& n : nodes) {
-    if (n.is_folder && n.id == folder_id &&
-        (n.is_virtual_root || n.source == source)) {
+    if (SameFolderNode(n, folder_id, folder_guid)) {
       return &n;
     }
     if (n.is_folder) {
       if (const BookmarkNode* hit =
-              FindFolderNodeRecursive(n.children, source, folder_id)) {
+              FindFolderNodeRecursive(n.children, folder_id, folder_guid)) {
         return hit;
       }
     }
@@ -1063,7 +1075,7 @@ void ReloadPopupStackItems() {
       win->items = mgr.root_snapshot;
     } else {
       const BookmarkNode* folder = FindFolderNodeRecursive(
-          *mgr.root_snapshot, win->folder_source, win->folder_id);
+          *mgr.root_snapshot, win->folder_id, win->folder_guid);
       if (!folder) {
         ClosePopupsFromLevel(static_cast<int>(lvl));
         if (lvl > 0) {
@@ -1075,7 +1087,7 @@ void ReloadPopupStackItems() {
       // Keep parent_item_index synced if parent order shifted.
       const auto& parent_items = GetItemsRef(mgr.stack[lvl - 1].get());
       for (size_t i = 0; i < parent_items.size(); ++i) {
-        if (parent_items[i].is_folder && parent_items[i].id == win->folder_id) {
+        if (SameFolderNode(parent_items[i], win->folder_id, win->folder_guid)) {
           win->parent_item_index = static_cast<int>(i);
           mgr.stack[lvl - 1]->open_child_index = static_cast<int>(i);
           break;
@@ -1283,14 +1295,18 @@ void CommitItemDrag(POINT release_screen) {
 
   BookmarkSource dst_source = target_win->folder_source;
   std::wstring dst_folder_id = target_win->folder_id;
+  std::wstring dst_folder_guid = target_win->folder_guid;
   std::wstring anchor_id;
+  std::wstring anchor_guid;
   bool insert_after = true;
 
   if (action == DropAction::kDropIntoFolder && valid_idx) {
     const BookmarkNode& folder = target_items[target_index];
     dst_source = folder.is_virtual_root ? src_node.source : folder.source;
     dst_folder_id = folder.is_virtual_root ? L"__other__" : folder.id;
+    dst_folder_guid = folder.is_virtual_root ? L"" : folder.guid;
     anchor_id.clear();
+    anchor_guid.clear();
     insert_after = true;
   } else if ((action == DropAction::kInsertBefore ||
               action == DropAction::kInsertAfter) &&
@@ -1300,15 +1316,19 @@ void CommitItemDrag(POINT release_screen) {
       // Inserting before virtual Other Bookmarks -> append to end of bookmark_bar.
       dst_source = src_node.source;
       dst_folder_id = L"__bookmark_bar__";
+      dst_folder_guid.clear();
       anchor_id.clear();
+      anchor_guid.clear();
       insert_after = true;
     } else {
       dst_source = anchor.source;
       anchor_id = anchor.id;
+      anchor_guid = anchor.guid;
       insert_after = (action == DropAction::kInsertAfter);
     }
   } else if (action == DropAction::kInsertAfter && target_win->level > 0) {
     anchor_id.clear();
+    anchor_guid.clear();
     insert_after = true;
   } else {
     (void)release_screen;
@@ -1316,8 +1336,9 @@ void CommitItemDrag(POINT release_screen) {
   }
 
   if (BookmarkModel::Instance().MoveBookmark(
-          src_node.source, src_node.id, dst_source, dst_folder_id, anchor_id,
-          insert_after, config.IsBookmarksShowOther())) {
+          src_node.source, src_node.id, src_node.guid, dst_source,
+          dst_folder_id, dst_folder_guid, anchor_id, anchor_guid, insert_after,
+          config.IsBookmarksShowOther())) {
     ReloadPopupStackItems();
   }
 }
@@ -1648,8 +1669,11 @@ void ShowContextMenuForPopup(PopupWindow* win,
   const BookmarkSource container_src =
       has_item ? target_node.source : win->folder_source;
   const std::wstring container_folder_id = win->folder_id;
+  const std::wstring container_folder_guid = win->folder_guid;
   const std::wstring anchor_id =
       (has_item && !target_node.is_virtual_root) ? target_node.id : L"";
+  const std::wstring anchor_guid =
+      (has_item && !target_node.is_virtual_root) ? target_node.guid : L"";
   HWND dlg_owner = mgr.chrome_root ? mgr.chrome_root : win->hwnd;
 
   switch (cmd) {
@@ -1689,7 +1713,7 @@ void ShowContextMenuForPopup(PopupWindow* win,
           break;
         }
         if (BookmarkModel::Instance().UpdateBookmark(
-                target_node.source, target_node.id, title,
+                target_node.source, target_node.id, target_node.guid, title,
                 is_url ? std::optional<std::wstring>(url) : std::nullopt,
                 config.IsBookmarksShowOther())) {
           ReloadPopupStackItems();
@@ -1709,7 +1733,7 @@ void ShowContextMenuForPopup(PopupWindow* win,
       }
       if (confirmed &&
           BookmarkModel::Instance().DeleteBookmark(
-              target_node.source, target_node.id,
+              target_node.source, target_node.id, target_node.guid,
               config.IsBookmarksShowOther())) {
         ReloadPopupStackItems();
       }
@@ -1721,8 +1745,9 @@ void ShowContextMenuForPopup(PopupWindow* win,
       if (ShowBookmarkEditDialog(dlg_owner, L"新建书签", true, title, url) &&
           !url.empty()) {
         if (BookmarkModel::Instance().AddBookmarkOrFolder(
-                container_src, container_folder_id, anchor_id,
-                /*insert_after=*/true, /*is_folder=*/false, title, url,
+                container_src, container_folder_id, container_folder_guid,
+                anchor_id, anchor_guid, /*insert_after=*/true,
+                /*is_folder=*/false, title, url,
                 config.IsBookmarksShowOther())) {
           ReloadPopupStackItems();
         }
@@ -1736,8 +1761,9 @@ void ShowContextMenuForPopup(PopupWindow* win,
                                  dummy_url) &&
           !title.empty()) {
         if (BookmarkModel::Instance().AddBookmarkOrFolder(
-                container_src, container_folder_id, anchor_id,
-                /*insert_after=*/true, /*is_folder=*/true, title, L"",
+                container_src, container_folder_id, container_folder_guid,
+                anchor_id, anchor_guid, /*insert_after=*/true,
+                /*is_folder=*/true, title, L"",
                 config.IsBookmarksShowOther())) {
           ReloadPopupStackItems();
         }
@@ -1749,12 +1775,14 @@ void ShowContextMenuForPopup(PopupWindow* win,
       std::wstring url = L"https://";
       const std::wstring dst_fid =
           target_node.is_virtual_root ? L"__other__" : target_node.id;
+      const std::wstring dst_fguid =
+          target_node.is_virtual_root ? L"" : target_node.guid;
       if (ShowBookmarkEditDialog(dlg_owner, L"在文件夹内新建书签", true, title,
                                  url) &&
           !url.empty()) {
         if (BookmarkModel::Instance().AddBookmarkOrFolder(
-                target_node.source, dst_fid, L"", /*insert_after=*/true,
-                /*is_folder=*/false, title, url,
+                target_node.source, dst_fid, dst_fguid, L"", L"",
+                /*insert_after=*/true, /*is_folder=*/false, title, url,
                 config.IsBookmarksShowOther())) {
           ReloadPopupStackItems();
         }
@@ -1766,12 +1794,14 @@ void ShowContextMenuForPopup(PopupWindow* win,
       std::wstring dummy_url;
       const std::wstring dst_fid =
           target_node.is_virtual_root ? L"__other__" : target_node.id;
+      const std::wstring dst_fguid =
+          target_node.is_virtual_root ? L"" : target_node.guid;
       if (ShowBookmarkEditDialog(dlg_owner, L"在文件夹内新建子文件夹", false,
                                  title, dummy_url) &&
           !title.empty()) {
         if (BookmarkModel::Instance().AddBookmarkOrFolder(
-                target_node.source, dst_fid, L"", /*insert_after=*/true,
-                /*is_folder=*/true, title, L"",
+                target_node.source, dst_fid, dst_fguid, L"", L"",
+                /*insert_after=*/true, /*is_folder=*/true, title, L"",
                 config.IsBookmarksShowOther())) {
           ReloadPopupStackItems();
         }
@@ -2184,6 +2214,7 @@ std::unique_ptr<PopupWindow> CreatePopupLevel(
     int level,
     int parent_item_index,
     std::wstring folder_id,
+    std::wstring folder_guid,
     BookmarkSource folder_source,
     std::shared_ptr<const std::vector<BookmarkNode>> items,
     POINT anchor_pt,
@@ -2194,6 +2225,7 @@ std::unique_ptr<PopupWindow> CreatePopupLevel(
   win->level = level;
   win->parent_item_index = parent_item_index;
   win->folder_id = std::move(folder_id);
+  win->folder_guid = std::move(folder_guid);
   win->folder_source = folder_source;
   win->items = std::move(items);
   if (!win->items || win->items->empty()) {
@@ -2266,9 +2298,11 @@ void OpenChildPopup(PopupWindow* parent, int item_index) {
       std::make_shared<std::vector<BookmarkNode>>(folder.children);
   const std::wstring child_folder_id =
       folder.is_virtual_root ? L"__other__" : folder.id;
+  const std::wstring child_folder_guid =
+      folder.is_virtual_root ? L"" : folder.guid;
   if (auto child = CreatePopupLevel(
-          parent->level + 1, item_index, child_folder_id, folder.source,
-          std::move(children_copy),
+          parent->level + 1, item_index, child_folder_id, child_folder_guid,
+          folder.source, std::move(children_copy),
           POINT{item_screen_rc.right, item_screen_rc.top}, true,
           item_screen_rc)) {
     GetManager().stack.push_back(std::move(child));
@@ -2430,8 +2464,8 @@ void ToggleBookmarkPopup(HWND chrome_root,
   }
 
   auto root_popup = CreatePopupLevel(
-      0, -1, L"__bookmark_bar__", root_src, mgr.root_snapshot, anchor_screen_pt,
-      false, RECT{});
+      0, -1, L"__bookmark_bar__", L"", root_src, mgr.root_snapshot,
+      anchor_screen_pt, false, RECT{});
   if (root_popup) {
     const HWND notify_hwnd = root_popup->hwnd;
     mgr.stack.push_back(std::move(root_popup));

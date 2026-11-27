@@ -11,6 +11,7 @@
 
 #include "appid.h"
 #include "bookmark_button.h"
+#include "bookmark_model.h"
 #include "config.h"
 #include "green.h"
 #include "hijack.h"
@@ -141,6 +142,7 @@ void RunStartupCommands() {
 // go only when they finish.
 // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-exitprocess
 DECLSPEC_NORETURN void WINAPI MyExitProcess(UINT exit_code) {
+  BookmarkModel::Instance().FlushPendingOpsToChromeFiles();
   if (should_run_exit_cmd.exchange(false)) {
     LaunchCommands(config.GetLaunchOnExit(), kExitCommandsWaitMs);
   }

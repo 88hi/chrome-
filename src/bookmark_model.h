@@ -16,6 +16,7 @@ enum class BookmarkSource {
 
 struct BookmarkNode {
   std::wstring id;
+  std::wstring guid;
   std::wstring title;
   std::wstring url;
   bool is_folder = false;
@@ -34,9 +35,9 @@ class BookmarkModel {
  public:
   static BookmarkModel& Instance();
 
-  // Checks the Chrome profile's Bookmarks/AccountBookmarks files and reloads if
-  // changed. Returns true if the tree was reloaded.
-  bool EnsureLoaded(bool show_other_bookmarks);
+  // Checks the Chrome profile's Bookmarks/AccountBookmarks files and Chrome++'s
+  // durable edit journal, reloading if changed (or if `force` is true).
+  bool EnsureLoaded(bool show_other_bookmarks, bool force = false);
 
   // Thread-safe snapshot of the top-level items (bookmark bar children,
   // optionally followed by "Other Bookmarks" folder).
@@ -51,28 +52,32 @@ class BookmarkModel {
   // needed, posting `notify_msg` to `notify_hwnd` when new icons are ready.
   void RequestFaviconsAsync(HWND notify_hwnd, UINT notify_msg);
 
-  // Moves or reorders a bookmark/folder in Chrome's Bookmarks/AccountBookmarks
-  // JSON file (preserving all metadata and updating checksum) and reloads the
-  // in-memory tree.
-  // `dst_folder_id`: L"__bookmark_bar__", L"__other__", or a folder node id.
-  // `anchor_id`: sibling node id to insert before/after, or empty to append.
+  // Moves or reorders a bookmark/folder. Records the edit in Chrome++'s durable
+  // journal (so Chrome's in-memory BookmarkStorage can never revert it), also
+  // updates Chrome's Bookmarks/AccountBookmarks file, and reloads immediately.
   bool MoveBookmark(BookmarkSource src_source,
                     const std::wstring& src_id,
+                    const std::wstring& src_guid,
                     BookmarkSource dst_source,
                     const std::wstring& dst_folder_id,
+                    const std::wstring& dst_folder_guid,
                     const std::wstring& anchor_id,
+                    const std::wstring& anchor_guid,
                     bool insert_after,
                     bool show_other_bookmarks);
 
   bool UpdateBookmark(BookmarkSource source,
                       const std::wstring& node_id,
+                      const std::wstring& node_guid,
                       const std::wstring& new_title,
                       const std::optional<std::wstring>& new_url,
                       bool show_other_bookmarks);
 
   bool AddBookmarkOrFolder(BookmarkSource dst_source,
                            const std::wstring& dst_folder_id,
+                           const std::wstring& dst_folder_guid,
                            const std::wstring& anchor_id,
+                           const std::wstring& anchor_guid,
                            bool insert_after,
                            bool is_folder,
                            const std::wstring& title,
@@ -81,7 +86,13 @@ class BookmarkModel {
 
   bool DeleteBookmark(BookmarkSource source,
                       const std::wstring& node_id,
+                      const std::wstring& node_guid,
                       bool show_other_bookmarks);
+
+  // Re-applies all durable Chrome++ bookmark edits onto Chrome's on-disk
+  // Bookmarks/AccountBookmarks files (called on browser exit so Chrome's native
+  // bookmark bar picks up the changes on next start).
+  void FlushPendingOpsToChromeFiles();
 
   // Returns diagnostic status when root items are empty.
   std::wstring GetDiagnosticInfo() const;

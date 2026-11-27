@@ -367,6 +367,11 @@ bool ParseBookmarkNode(JsonCursor& cur, BookmarkNode& node, int depth) {
         return false;
       }
       node.id = Utf8ToWide(val);
+    } else if (key == "guid") {
+      if (!cur.ParseString(val)) {
+        return false;
+      }
+      node.guid = Utf8ToWide(val);
     } else if (key == "name") {
       if (!cur.ParseString(val)) {
         return false;
@@ -547,9 +552,12 @@ std::optional<std::wstring> ParseLastUsedProfile(std::string_view json) {
   return std::nullopt;
 }
 
+constexpr wchar_t kOpsFileName[] = L"ChromePlus_BookmarkOps.json";
+
 struct CombinedBookmarkStamp {
   std::optional<FileStamp> local_stamp;
   std::optional<FileStamp> account_stamp;
+  std::optional<FileStamp> journal_stamp;
 
   bool HasAny() const {
     return local_stamp.has_value() || account_stamp.has_value();
@@ -570,6 +578,10 @@ CombinedBookmarkStamp GetProfileBookmarkStamp(const std::wstring& profile_dir) {
   }
   s.local_stamp = GetFileStamp(profile_dir + L"\\Bookmarks");
   s.account_stamp = GetFileStamp(profile_dir + L"\\AccountBookmarks");
+  s.journal_stamp = GetFileStamp(profile_dir + L"\\" + kOpsFileName);
+  if (!s.journal_stamp) {
+    s.journal_stamp = GetFileStamp(GetAppDir() + L"\\" + kOpsFileName);
+  }
   return s;
 }
 
@@ -1282,106 +1294,6 @@ uint64_t GetChromeWebKitTimestamp() {
   return win_100ns / 10;  // Microseconds since 1601-01-01.
 }
 
-bool AstContainsNodeId(const JsonValue& node, std::string_view target_id) {
-  if (node.type != JsonValue::Type::kObject) {
-    return false;
-  }
-  if (node.GetString("id") == target_id) {
-    return true;
-  }
-  if (const JsonValue* children = node.Find("children");
-      children && children->type == JsonValue::Type::kArray) {
-    for (const auto& child : children->arr_val) {
-      if (AstContainsNodeId(child, target_id)) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-JsonValue* FindFolderObjectById(JsonValue& node, std::string_view folder_id) {
-  if (node.type != JsonValue::Type::kObject) {
-    return nullptr;
-  }
-  if (node.GetString("id") == folder_id &&
-      node.GetString("type") == "folder") {
-    return &node;
-  }
-  if (JsonValue* children = node.Find("children");
-      children && children->type == JsonValue::Type::kArray) {
-    for (auto& child : children->arr_val) {
-      if (JsonValue* hit = FindFolderObjectById(child, folder_id)) {
-        return hit;
-      }
-    }
-  }
-  return nullptr;
-}
-
-JsonValue* ResolveDestinationFolder(JsonValue& doc,
-                                    std::string_view dst_folder_id) {
-  JsonValue* roots = doc.Find("roots");
-  if (!roots || roots->type != JsonValue::Type::kObject) {
-    return nullptr;
-  }
-  if (dst_folder_id == "__bookmark_bar__") {
-    return roots->Find("bookmark_bar");
-  }
-  if (dst_folder_id == "__other__") {
-    return roots->Find("other");
-  }
-  for (const char* key : {"bookmark_bar", "other", "synced"}) {
-    if (JsonValue* r = roots->Find(key)) {
-      if (JsonValue* hit = FindFolderObjectById(*r, dst_folder_id)) {
-        return hit;
-      }
-    }
-  }
-  return nullptr;
-}
-
-bool ExtractNodeById(JsonValue& folder,
-                     std::string_view target_id,
-                     JsonValue& extracted_out) {
-  JsonValue* children = folder.Find("children");
-  if (!children || children->type != JsonValue::Type::kArray) {
-    return false;
-  }
-  for (auto it = children->arr_val.begin(); it != children->arr_val.end();
-       ++it) {
-    if (it->GetString("id") == target_id) {
-      extracted_out = std::move(*it);
-      children->arr_val.erase(it);
-      folder.SetString("date_modified",
-                       std::to_string(GetChromeWebKitTimestamp()));
-      return true;
-    }
-    if (it->GetString("type") == "folder" &&
-        ExtractNodeById(*it, target_id, extracted_out)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-bool ExtractNodeFromDoc(JsonValue& doc,
-                        std::string_view target_id,
-                        JsonValue& extracted_out) {
-  JsonValue* roots = doc.Find("roots");
-  if (!roots || roots->type != JsonValue::Type::kObject) {
-    return false;
-  }
-  for (const char* key : {"bookmark_bar", "other", "synced"}) {
-    if (JsonValue* r = roots->Find(key)) {
-      if (ExtractNodeById(*r, target_id, extracted_out)) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
 void FindMaxNumericId(const JsonValue& node, uint64_t& max_id) {
   if (node.type != JsonValue::Type::kObject) {
     return;
@@ -1400,43 +1312,41 @@ void FindMaxNumericId(const JsonValue& node, uint64_t& max_id) {
   }
 }
 
-void ReassignSubtreeIds(JsonValue& node, uint64_t& next_id) {
-  if (node.type != JsonValue::Type::kObject) {
-    return;
-  }
-  node.SetString("id", std::to_string(++next_id));
-  if (JsonValue* children = node.Find("children");
-      children && children->type == JsonValue::Type::kArray) {
-    for (auto& child : children->arr_val) {
-      ReassignSubtreeIds(child, next_id);
-    }
-  }
-}
-
 bool WriteFileAtomicUtf8(const std::wstring& path, std::string_view content) {
   const std::wstring tmp_path =
       path + L".cpp_tmp_" + std::to_wstring(::GetCurrentProcessId());
   HANDLE file = ::CreateFileW(tmp_path.c_str(), GENERIC_WRITE, 0, nullptr,
                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (file == INVALID_HANDLE_VALUE) {
+  if (file != INVALID_HANDLE_VALUE) {
+    DWORD written = 0;
+    const bool ok =
+        ::WriteFile(file, content.data(), static_cast<DWORD>(content.size()),
+                    &written, nullptr) &&
+        written == content.size();
+    ::CloseHandle(file);
+    if (ok && ::MoveFileExW(tmp_path.c_str(), path.c_str(),
+                            MOVEFILE_REPLACE_EXISTING |
+                                MOVEFILE_WRITE_THROUGH)) {
+      return true;
+    }
+    ::DeleteFileW(tmp_path.c_str());
+  }
+
+  // Fallback: direct shared overwrite if MoveFileExW hit a sharing conflict.
+  HANDLE direct = ::CreateFileW(
+      path.c_str(), GENERIC_WRITE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+      CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (direct == INVALID_HANDLE_VALUE) {
     return false;
   }
   DWORD written = 0;
   const bool ok =
-      ::WriteFile(file, content.data(), static_cast<DWORD>(content.size()),
+      ::WriteFile(direct, content.data(), static_cast<DWORD>(content.size()),
                   &written, nullptr) &&
       written == content.size();
-  ::CloseHandle(file);
-  if (!ok) {
-    ::DeleteFileW(tmp_path.c_str());
-    return false;
-  }
-  if (!::MoveFileExW(tmp_path.c_str(), path.c_str(),
-                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-    ::DeleteFileW(tmp_path.c_str());
-    return false;
-  }
-  return true;
+  ::CloseHandle(direct);
+  return ok;
 }
 
 bool SaveBookmarkDoc(const std::wstring& path, JsonValue& doc) {
@@ -1449,13 +1359,6 @@ bool SaveBookmarkDoc(const std::wstring& path, JsonValue& doc) {
   SerializeJsonValue(out, doc, 0);
   out.push_back('\n');
   return WriteFileAtomicUtf8(path, out);
-}
-
-std::wstring BookmarkSourcePath(const std::wstring& profile_dir,
-                                BookmarkSource source) {
-  return profile_dir +
-         (source == BookmarkSource::kAccount ? L"\\AccountBookmarks"
-                                             : L"\\Bookmarks");
 }
 
 std::string GenerateUuidV4() {
@@ -1484,47 +1387,753 @@ std::string GenerateUuidV4() {
   return out;
 }
 
-JsonValue* FindNodeByIdRecursive(JsonValue& node,
-                                 std::string_view target_id,
-                                 JsonValue** out_parent) {
-  if (node.type != JsonValue::Type::kObject) {
-    return nullptr;
+// Durable edit journal stored independently of Chrome's Bookmarks file so
+// Chrome's in-memory BookmarkStorage / Sync can never revert user edits.
+struct BookmarkOp {
+  enum class Kind {
+    kMove,
+    kUpdate,
+    kAdd,
+    kDelete,
+  };
+  Kind kind = Kind::kMove;
+  BookmarkSource dst_source = BookmarkSource::kLocal;
+  std::string id;
+  std::string guid;
+  std::string dst_folder_id;
+  std::string dst_folder_guid;
+  std::string anchor_id;
+  std::string anchor_guid;
+  bool insert_after = true;
+  bool is_folder = false;
+  bool has_url = false;
+  std::string title;
+  std::string url;
+};
+
+std::wstring GetJournalPath(const std::wstring& profile_dir) {
+  if (!profile_dir.empty()) {
+    return profile_dir + L"\\" + kOpsFileName;
   }
-  if (JsonValue* children = node.Find("children");
-      children && children->type == JsonValue::Type::kArray) {
-    for (auto& child : children->arr_val) {
-      if (child.GetString("id") == target_id) {
-        if (out_parent) {
-          *out_parent = &node;
-        }
-        return &child;
+  return GetAppDir() + L"\\" + kOpsFileName;
+}
+
+bool MatchesNodeIdOrGuid(const BookmarkNode& node,
+                         std::wstring_view target_id,
+                         std::wstring_view target_guid) {
+  if (!target_guid.empty() && !node.guid.empty()) {
+    return node.guid == target_guid;
+  }
+  return !target_id.empty() && node.id == target_id;
+}
+
+bool MatchesAstIdOrGuid(const JsonValue& node,
+                        std::string_view target_id,
+                        std::string_view target_guid) {
+  if (node.type != JsonValue::Type::kObject) {
+    return false;
+  }
+  if (!target_guid.empty()) {
+    const std::string g = node.GetString("guid");
+    if (!g.empty()) {
+      return g == target_guid;
+    }
+  }
+  return !target_id.empty() && node.GetString("id") == target_id;
+}
+
+bool SameOpTarget(const BookmarkOp& a,
+                  std::string_view id,
+                  std::string_view guid) {
+  if (!guid.empty() && !a.guid.empty()) {
+    return a.guid == guid;
+  }
+  return !id.empty() && a.id == id;
+}
+
+std::vector<BookmarkOp> LoadJournalFromDisk(const std::wstring& profile_dir) {
+  std::vector<BookmarkOp> ops;
+  std::optional<std::string> text =
+      ReadFileSharedUtf8(GetJournalPath(profile_dir), 16 * 1024 * 1024);
+  if (!text) {
+    text = ReadFileSharedUtf8(GetAppDir() + L"\\" + kOpsFileName,
+                              16 * 1024 * 1024);
+  }
+  if (!text) {
+    return ops;
+  }
+
+  JsonValue root;
+  AstJsonParser parser(*text);
+  if (!parser.Parse(root) || root.type != JsonValue::Type::kArray) {
+    return ops;
+  }
+
+  for (const auto& item : root.arr_val) {
+    if (item.type != JsonValue::Type::kObject) {
+      continue;
+    }
+    const std::string kind_str = item.GetString("op");
+    BookmarkOp op;
+    if (kind_str == "move") {
+      op.kind = BookmarkOp::Kind::kMove;
+    } else if (kind_str == "update") {
+      op.kind = BookmarkOp::Kind::kUpdate;
+    } else if (kind_str == "add") {
+      op.kind = BookmarkOp::Kind::kAdd;
+    } else if (kind_str == "delete") {
+      op.kind = BookmarkOp::Kind::kDelete;
+    } else {
+      continue;
+    }
+    op.dst_source = item.GetString("dst_source") == "account"
+                        ? BookmarkSource::kAccount
+                        : BookmarkSource::kLocal;
+    op.id = item.GetString("id");
+    op.guid = item.GetString("guid");
+    op.dst_folder_id = item.GetString("dst_folder_id");
+    op.dst_folder_guid = item.GetString("dst_folder_guid");
+    op.anchor_id = item.GetString("anchor_id");
+    op.anchor_guid = item.GetString("anchor_guid");
+    if (const JsonValue* v = item.Find("insert_after");
+        v && v->type == JsonValue::Type::kBool) {
+      op.insert_after = v->bool_val;
+    }
+    if (const JsonValue* v = item.Find("is_folder");
+        v && v->type == JsonValue::Type::kBool) {
+      op.is_folder = v->bool_val;
+    }
+    if (const JsonValue* v = item.Find("has_url");
+        v && v->type == JsonValue::Type::kBool) {
+      op.has_url = v->bool_val;
+    }
+    op.title = item.GetString("title");
+    op.url = item.GetString("url");
+    ops.push_back(std::move(op));
+  }
+  return ops;
+}
+
+bool SaveJournalToDisk(const std::wstring& profile_dir,
+                       const std::vector<BookmarkOp>& ops) {
+  JsonValue root;
+  root.type = JsonValue::Type::kArray;
+  root.arr_val.reserve(ops.size());
+
+  auto make_bool = [](bool b) {
+    JsonValue jv;
+    jv.type = JsonValue::Type::kBool;
+    jv.bool_val = b;
+    return jv;
+  };
+
+  for (const auto& op : ops) {
+    JsonValue obj;
+    obj.type = JsonValue::Type::kObject;
+    switch (op.kind) {
+      case BookmarkOp::Kind::kMove:
+        obj.SetString("op", "move");
+        break;
+      case BookmarkOp::Kind::kUpdate:
+        obj.SetString("op", "update");
+        break;
+      case BookmarkOp::Kind::kAdd:
+        obj.SetString("op", "add");
+        break;
+      case BookmarkOp::Kind::kDelete:
+        obj.SetString("op", "delete");
+        break;
+    }
+    if (op.dst_source == BookmarkSource::kAccount) {
+      obj.SetString("dst_source", "account");
+    }
+    if (!op.id.empty()) obj.SetString("id", op.id);
+    if (!op.guid.empty()) obj.SetString("guid", op.guid);
+    if (!op.dst_folder_id.empty()) {
+      obj.SetString("dst_folder_id", op.dst_folder_id);
+    }
+    if (!op.dst_folder_guid.empty()) {
+      obj.SetString("dst_folder_guid", op.dst_folder_guid);
+    }
+    if (!op.anchor_id.empty()) obj.SetString("anchor_id", op.anchor_id);
+    if (!op.anchor_guid.empty()) obj.SetString("anchor_guid", op.anchor_guid);
+    if (op.kind == BookmarkOp::Kind::kMove ||
+        op.kind == BookmarkOp::Kind::kAdd) {
+      obj.obj_val.emplace_back("insert_after", make_bool(op.insert_after));
+    }
+    if (op.kind == BookmarkOp::Kind::kAdd) {
+      obj.obj_val.emplace_back("is_folder", make_bool(op.is_folder));
+    }
+    if (op.kind == BookmarkOp::Kind::kUpdate) {
+      obj.obj_val.emplace_back("has_url", make_bool(op.has_url));
+    }
+    if (op.kind == BookmarkOp::Kind::kUpdate ||
+        op.kind == BookmarkOp::Kind::kAdd) {
+      obj.SetString("title", op.title);
+      if (!op.url.empty() || op.has_url) {
+        obj.SetString("url", op.url);
       }
-      if (child.GetString("type") == "folder") {
-        if (JsonValue* hit =
-                FindNodeByIdRecursive(child, target_id, out_parent)) {
-          return hit;
+    }
+    root.arr_val.push_back(std::move(obj));
+  }
+
+  std::string out;
+  out.reserve(8192);
+  SerializeJsonValue(out, root, 0);
+  out.push_back('\n');
+
+  if (WriteFileAtomicUtf8(GetJournalPath(profile_dir), out)) {
+    return true;
+  }
+  return WriteFileAtomicUtf8(GetAppDir() + L"\\" + kOpsFileName, out);
+}
+
+void AppendAndCompactOp(std::vector<BookmarkOp>& ops, BookmarkOp op) {
+  if (op.kind == BookmarkOp::Kind::kUpdate) {
+    // Update an earlier Chrome++ Add op or Update op in-place if present.
+    for (auto it = ops.rbegin(); it != ops.rend(); ++it) {
+      if (SameOpTarget(*it, op.id, op.guid)) {
+        if (it->kind == BookmarkOp::Kind::kAdd) {
+          it->title = op.title;
+          if (op.has_url) {
+            it->url = op.url;
+          }
+          return;
         }
+        if (it->kind == BookmarkOp::Kind::kUpdate) {
+          it->title = op.title;
+          if (op.has_url) {
+            it->has_url = true;
+            it->url = op.url;
+          }
+          return;
+        }
+      }
+    }
+    ops.push_back(std::move(op));
+    return;
+  }
+
+  if (op.kind == BookmarkOp::Kind::kDelete) {
+    // Drop earlier ops targeting this node, then always keep kDelete so even a
+    // previously-flushed local addition is removed from Chrome's disk file too.
+    std::erase_if(ops, [&](const BookmarkOp& existing) {
+      return SameOpTarget(existing, op.id, op.guid);
+    });
+    ops.push_back(std::move(op));
+    return;
+  }
+
+  ops.push_back(std::move(op));
+}
+
+// --- In-memory tree replay helpers ---
+
+bool TreeContainsNode(const std::vector<BookmarkNode>& list,
+                      std::wstring_view id,
+                      std::wstring_view guid) {
+  for (const auto& n : list) {
+    if (MatchesNodeIdOrGuid(n, id, guid)) {
+      return true;
+    }
+    if (n.is_folder && TreeContainsNode(n.children, id, guid)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+BookmarkNode* FindNodeInTree(std::vector<BookmarkNode>& list,
+                             std::wstring_view id,
+                             std::wstring_view guid) {
+  for (auto& n : list) {
+    if (MatchesNodeIdOrGuid(n, id, guid)) {
+      return &n;
+    }
+    if (n.is_folder) {
+      if (BookmarkNode* hit = FindNodeInTree(n.children, id, guid)) {
+        return hit;
       }
     }
   }
   return nullptr;
 }
 
-JsonValue* FindNodeByIdInDoc(JsonValue& doc,
-                             std::string_view target_id,
-                             JsonValue** out_parent) {
+bool ExtractNodeFromTree(std::vector<BookmarkNode>& list,
+                         std::wstring_view id,
+                         std::wstring_view guid,
+                         BookmarkNode& out) {
+  for (auto it = list.begin(); it != list.end(); ++it) {
+    if (MatchesNodeIdOrGuid(*it, id, guid)) {
+      out = std::move(*it);
+      list.erase(it);
+      return true;
+    }
+    if (it->is_folder && ExtractNodeFromTree(it->children, id, guid, out)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::vector<BookmarkNode>* ResolveTreeFolderChildren(
+    std::vector<BookmarkNode>& bar_items,
+    std::vector<BookmarkNode>& other_items,
+    std::wstring_view folder_id,
+    std::wstring_view folder_guid) {
+  if (folder_id == L"__bookmark_bar__") {
+    return &bar_items;
+  }
+  if (folder_id == L"__other__") {
+    return &other_items;
+  }
+  if (BookmarkNode* hit = FindNodeInTree(bar_items, folder_id, folder_guid);
+      hit && hit->is_folder) {
+    return &hit->children;
+  }
+  if (BookmarkNode* hit = FindNodeInTree(other_items, folder_id, folder_guid);
+      hit && hit->is_folder) {
+    return &hit->children;
+  }
+  return nullptr;
+}
+
+void InsertNodeAtAnchor(std::vector<BookmarkNode>& list,
+                        BookmarkNode node,
+                        std::wstring_view anchor_id,
+                        std::wstring_view anchor_guid,
+                        bool insert_after) {
+  size_t pos = list.size();
+  if (!anchor_id.empty() || !anchor_guid.empty()) {
+    for (size_t i = 0; i < list.size(); ++i) {
+      if (MatchesNodeIdOrGuid(list[i], anchor_id, anchor_guid)) {
+        pos = insert_after ? (i + 1) : i;
+        break;
+      }
+    }
+  }
+  list.insert(list.begin() + static_cast<ptrdiff_t>(pos), std::move(node));
+}
+
+void ApplyOpsToInMemoryTree(std::vector<BookmarkNode>& bar_items,
+                            std::vector<BookmarkNode>& other_items,
+                            BookmarkSource default_source,
+                            const std::vector<BookmarkOp>& ops) {
+  for (const auto& op : ops) {
+    const std::wstring id_w = Utf8ToWide(op.id);
+    const std::wstring guid_w = Utf8ToWide(op.guid);
+    const std::wstring dst_id_w = Utf8ToWide(op.dst_folder_id);
+    const std::wstring dst_guid_w = Utf8ToWide(op.dst_folder_guid);
+    const std::wstring anc_id_w = Utf8ToWide(op.anchor_id);
+    const std::wstring anc_guid_w = Utf8ToWide(op.anchor_guid);
+
+    switch (op.kind) {
+      case BookmarkOp::Kind::kAdd: {
+        if (TreeContainsNode(bar_items, id_w, guid_w) ||
+            TreeContainsNode(other_items, id_w, guid_w)) {
+          break;
+        }
+        auto* dst = ResolveTreeFolderChildren(bar_items, other_items, dst_id_w,
+                                              dst_guid_w);
+        if (!dst) {
+          break;
+        }
+        BookmarkNode node;
+        node.id = id_w;
+        node.guid = guid_w;
+        node.is_folder = op.is_folder;
+        node.title = Utf8ToWide(op.title);
+        node.url = Utf8ToWide(op.url);
+        node.source = op.dst_source == BookmarkSource::kAccount
+                          ? BookmarkSource::kAccount
+                          : default_source;
+        InsertNodeAtAnchor(*dst, std::move(node), anc_id_w, anc_guid_w,
+                           op.insert_after);
+        break;
+      }
+      case BookmarkOp::Kind::kUpdate: {
+        BookmarkNode* hit = FindNodeInTree(bar_items, id_w, guid_w);
+        if (!hit) {
+          hit = FindNodeInTree(other_items, id_w, guid_w);
+        }
+        if (hit) {
+          hit->title = Utf8ToWide(op.title);
+          if (op.has_url && !hit->is_folder) {
+            hit->url = Utf8ToWide(op.url);
+          }
+        }
+        break;
+      }
+      case BookmarkOp::Kind::kDelete: {
+        BookmarkNode dummy;
+        if (!ExtractNodeFromTree(bar_items, id_w, guid_w, dummy)) {
+          ExtractNodeFromTree(other_items, id_w, guid_w, dummy);
+        }
+        break;
+      }
+      case BookmarkOp::Kind::kMove: {
+        if (dst_id_w == id_w && !id_w.empty()) {
+          break;
+        }
+        if (!dst_guid_w.empty() && dst_guid_w == guid_w) {
+          break;
+        }
+        BookmarkNode moved;
+        if (!ExtractNodeFromTree(bar_items, id_w, guid_w, moved) &&
+            !ExtractNodeFromTree(other_items, id_w, guid_w, moved)) {
+          break;
+        }
+        if (moved.is_folder &&
+            TreeContainsNode(moved.children, dst_id_w, dst_guid_w)) {
+          // Cycle guard: put back at end of bar_items.
+          bar_items.push_back(std::move(moved));
+          break;
+        }
+        auto* dst = ResolveTreeFolderChildren(bar_items, other_items, dst_id_w,
+                                              dst_guid_w);
+        if (!dst) {
+          bar_items.push_back(std::move(moved));
+          break;
+        }
+        InsertNodeAtAnchor(*dst, std::move(moved), anc_id_w, anc_guid_w,
+                           op.insert_after);
+        break;
+      }
+    }
+  }
+}
+
+// --- On-disk Chrome JSON AST replay helpers ---
+
+bool AstContainsIdOrGuid(const JsonValue& node,
+                         std::string_view id,
+                         std::string_view guid) {
+  if (MatchesAstIdOrGuid(node, id, guid)) {
+    return true;
+  }
+  if (const JsonValue* children = node.Find("children");
+      children && children->type == JsonValue::Type::kArray) {
+    for (const auto& child : children->arr_val) {
+      if (AstContainsIdOrGuid(child, id, guid)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+JsonValue* FindAstFolder(JsonValue& node,
+                         std::string_view id,
+                         std::string_view guid) {
+  if (node.type != JsonValue::Type::kObject) {
+    return nullptr;
+  }
+  if (node.GetString("type") == "folder" &&
+      MatchesAstIdOrGuid(node, id, guid)) {
+    return &node;
+  }
+  if (JsonValue* children = node.Find("children");
+      children && children->type == JsonValue::Type::kArray) {
+    for (auto& child : children->arr_val) {
+      if (JsonValue* hit = FindAstFolder(child, id, guid)) {
+        return hit;
+      }
+    }
+  }
+  return nullptr;
+}
+
+JsonValue* ResolveAstFolder(JsonValue& doc,
+                            std::string_view folder_id,
+                            std::string_view folder_guid) {
+  JsonValue* roots = doc.Find("roots");
+  if (!roots || roots->type != JsonValue::Type::kObject) {
+    return nullptr;
+  }
+  if (folder_id == "__bookmark_bar__") {
+    return roots->Find("bookmark_bar");
+  }
+  if (folder_id == "__other__") {
+    return roots->Find("other");
+  }
+  for (const char* key : {"bookmark_bar", "other", "synced"}) {
+    if (JsonValue* r = roots->Find(key)) {
+      if (JsonValue* hit = FindAstFolder(*r, folder_id, folder_guid)) {
+        return hit;
+      }
+    }
+  }
+  return nullptr;
+}
+
+JsonValue* FindAstNodeInDoc(JsonValue& doc,
+                            std::string_view id,
+                            std::string_view guid,
+                            JsonValue** out_parent) {
+  auto walk = [&](auto&& self, JsonValue& parent) -> JsonValue* {
+    JsonValue* children = parent.Find("children");
+    if (!children || children->type != JsonValue::Type::kArray) {
+      return nullptr;
+    }
+    for (auto& child : children->arr_val) {
+      if (MatchesAstIdOrGuid(child, id, guid)) {
+        if (out_parent) {
+          *out_parent = &parent;
+        }
+        return &child;
+      }
+      if (child.GetString("type") == "folder") {
+        if (JsonValue* hit = self(self, child)) {
+          return hit;
+        }
+      }
+    }
+    return nullptr;
+  };
   JsonValue* roots = doc.Find("roots");
   if (!roots || roots->type != JsonValue::Type::kObject) {
     return nullptr;
   }
   for (const char* key : {"bookmark_bar", "other", "synced"}) {
     if (JsonValue* r = roots->Find(key)) {
-      if (JsonValue* hit = FindNodeByIdRecursive(*r, target_id, out_parent)) {
+      if (JsonValue* hit = walk(walk, *r)) {
         return hit;
       }
     }
   }
   return nullptr;
+}
+
+bool ExtractAstNodeFromDoc(JsonValue& doc,
+                           std::string_view id,
+                           std::string_view guid,
+                           JsonValue& extracted_out) {
+  auto walk = [&](auto&& self, JsonValue& parent) -> bool {
+    JsonValue* children = parent.Find("children");
+    if (!children || children->type != JsonValue::Type::kArray) {
+      return false;
+    }
+    for (auto it = children->arr_val.begin(); it != children->arr_val.end();
+         ++it) {
+      if (MatchesAstIdOrGuid(*it, id, guid)) {
+        extracted_out = std::move(*it);
+        children->arr_val.erase(it);
+        parent.SetString("date_modified",
+                         std::to_string(GetChromeWebKitTimestamp()));
+        return true;
+      }
+      if (it->GetString("type") == "folder" && self(self, *it)) {
+        return true;
+      }
+    }
+    return false;
+  };
+  JsonValue* roots = doc.Find("roots");
+  if (!roots || roots->type != JsonValue::Type::kObject) {
+    return false;
+  }
+  for (const char* key : {"bookmark_bar", "other", "synced"}) {
+    if (JsonValue* r = roots->Find(key)) {
+      if (walk(walk, *r)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool ApplyOpsToChromeFile(const std::wstring& path,
+                          BookmarkSource file_source,
+                          bool has_other_file,
+                          const std::vector<BookmarkOp>& ops) {
+  if (ops.empty()) {
+    return true;
+  }
+  const auto text = ReadFileSharedUtf8(path, 64 * 1024 * 1024);
+  if (!text) {
+    return false;
+  }
+  JsonValue doc;
+  AstJsonParser parser(*text);
+  if (!parser.Parse(doc)) {
+    return false;
+  }
+
+  bool modified = false;
+  const std::string now_ts = std::to_string(GetChromeWebKitTimestamp());
+
+  for (const auto& op : ops) {
+    switch (op.kind) {
+      case BookmarkOp::Kind::kAdd: {
+        if (has_other_file &&
+            (op.dst_folder_id == "__bookmark_bar__" ||
+             op.dst_folder_id == "__other__") &&
+            op.dst_source != file_source) {
+          break;
+        }
+        if (FindAstNodeInDoc(doc, op.id, op.guid, nullptr)) {
+          break;
+        }
+        JsonValue* dst_folder =
+            ResolveAstFolder(doc, op.dst_folder_id, op.dst_folder_guid);
+        if (!dst_folder) {
+          break;
+        }
+        JsonValue* dst_children = dst_folder->Find("children");
+        if (!dst_children) {
+          JsonValue arr;
+          arr.type = JsonValue::Type::kArray;
+          dst_folder->obj_val.emplace_back("children", std::move(arr));
+          dst_children = dst_folder->Find("children");
+        }
+        if (!dst_children || dst_children->type != JsonValue::Type::kArray) {
+          break;
+        }
+
+        uint64_t max_id = 0;
+        if (const JsonValue* roots = doc.Find("roots")) {
+          for (const char* key : {"bookmark_bar", "other", "synced"}) {
+            if (const JsonValue* r = roots->Find(key)) {
+              FindMaxNumericId(*r, max_id);
+            }
+          }
+        }
+        JsonValue new_node;
+        new_node.type = JsonValue::Type::kObject;
+        if (op.is_folder) {
+          JsonValue empty_arr;
+          empty_arr.type = JsonValue::Type::kArray;
+          new_node.obj_val.emplace_back("children", std::move(empty_arr));
+          new_node.SetString("date_added", now_ts);
+          new_node.SetString("date_last_used", "0");
+          new_node.SetString("date_modified", now_ts);
+          new_node.SetString("guid", op.guid);
+          new_node.SetString("id", std::to_string(max_id + 1));
+          new_node.SetString("name", op.title);
+          new_node.SetString("type", "folder");
+        } else {
+          new_node.SetString("date_added", now_ts);
+          new_node.SetString("date_last_used", "0");
+          new_node.SetString("guid", op.guid);
+          new_node.SetString("id", std::to_string(max_id + 1));
+          new_node.SetString("name", op.title.empty() ? op.url : op.title);
+          new_node.SetString("type", "url");
+          new_node.SetString("url", op.url);
+        }
+
+        size_t pos = dst_children->arr_val.size();
+        if (!op.anchor_id.empty() || !op.anchor_guid.empty()) {
+          for (size_t i = 0; i < dst_children->arr_val.size(); ++i) {
+            if (MatchesAstIdOrGuid(dst_children->arr_val[i], op.anchor_id,
+                                   op.anchor_guid)) {
+              pos = op.insert_after ? (i + 1) : i;
+              break;
+            }
+          }
+        }
+        dst_children->arr_val.insert(
+            dst_children->arr_val.begin() + static_cast<ptrdiff_t>(pos),
+            std::move(new_node));
+        dst_folder->SetString("date_modified", now_ts);
+        modified = true;
+        break;
+      }
+      case BookmarkOp::Kind::kUpdate: {
+        JsonValue* parent = nullptr;
+        JsonValue* node = FindAstNodeInDoc(doc, op.id, op.guid, &parent);
+        if (!node) {
+          break;
+        }
+        node->SetString("name", op.title);
+        if (op.has_url && node->GetString("type") == "url") {
+          node->SetString("url", op.url);
+        }
+        if (node->GetString("type") == "folder") {
+          node->SetString("date_modified", now_ts);
+        }
+        if (parent) {
+          parent->SetString("date_modified", now_ts);
+        }
+        modified = true;
+        break;
+      }
+      case BookmarkOp::Kind::kDelete: {
+        JsonValue removed;
+        if (ExtractAstNodeFromDoc(doc, op.id, op.guid, removed)) {
+          modified = true;
+        }
+        break;
+      }
+      case BookmarkOp::Kind::kMove: {
+        JsonValue* dst_folder =
+            ResolveAstFolder(doc, op.dst_folder_id, op.dst_folder_guid);
+        if (!dst_folder) {
+          break;
+        }
+        JsonValue moved;
+        if (!ExtractAstNodeFromDoc(doc, op.id, op.guid, moved)) {
+          break;
+        }
+        if (AstContainsIdOrGuid(moved, op.dst_folder_id, op.dst_folder_guid)) {
+          break;
+        }
+        dst_folder =
+            ResolveAstFolder(doc, op.dst_folder_id, op.dst_folder_guid);
+        if (!dst_folder) {
+          break;
+        }
+        JsonValue* dst_children = dst_folder->Find("children");
+        if (!dst_children) {
+          JsonValue arr;
+          arr.type = JsonValue::Type::kArray;
+          dst_folder->obj_val.emplace_back("children", std::move(arr));
+          dst_children = dst_folder->Find("children");
+        }
+        if (!dst_children || dst_children->type != JsonValue::Type::kArray) {
+          break;
+        }
+        size_t pos = dst_children->arr_val.size();
+        if (!op.anchor_id.empty() || !op.anchor_guid.empty()) {
+          for (size_t i = 0; i < dst_children->arr_val.size(); ++i) {
+            if (MatchesAstIdOrGuid(dst_children->arr_val[i], op.anchor_id,
+                                   op.anchor_guid)) {
+              pos = op.insert_after ? (i + 1) : i;
+              break;
+            }
+          }
+        }
+        dst_children->arr_val.insert(
+            dst_children->arr_val.begin() + static_cast<ptrdiff_t>(pos),
+            std::move(moved));
+        dst_folder->SetString("date_modified", now_ts);
+        modified = true;
+        break;
+      }
+    }
+  }
+
+  if (!modified) {
+    return true;
+  }
+  return SaveBookmarkDoc(path, doc);
+}
+
+void FlushJournalToProfileFiles(const std::wstring& profile_dir,
+                                const std::vector<BookmarkOp>& ops) {
+  if (profile_dir.empty() || ops.empty()) {
+    return;
+  }
+  const std::wstring account_path = profile_dir + L"\\AccountBookmarks";
+  const std::wstring local_path = profile_dir + L"\\Bookmarks";
+  const bool has_account = GetFileStamp(account_path).has_value();
+  const bool has_local = GetFileStamp(local_path).has_value();
+  if (has_account) {
+    ApplyOpsToChromeFile(account_path, BookmarkSource::kAccount, has_local,
+                         ops);
+  }
+  if (has_local) {
+    ApplyOpsToChromeFile(local_path, BookmarkSource::kLocal, has_account, ops);
+  }
 }
 
 }  // namespace
@@ -1534,7 +2143,7 @@ BookmarkModel& BookmarkModel::Instance() {
   return instance;
 }
 
-bool BookmarkModel::EnsureLoaded(bool show_other_bookmarks) {
+bool BookmarkModel::EnsureLoaded(bool show_other_bookmarks, bool force) {
   auto& store = GetStore();
   std::wstring tried;
   const auto profile_dir = FindBestActiveProfileDir(&tried);
@@ -1552,7 +2161,7 @@ bool BookmarkModel::EnsureLoaded(bool show_other_bookmarks) {
     return false;
   }
 
-  {
+  if (!force) {
     std::lock_guard lock(store.mutex);
     if (store.profile_dir == *profile_dir &&
         store.bookmarks_stamp == stamp &&
@@ -1565,6 +2174,7 @@ bool BookmarkModel::EnsureLoaded(bool show_other_bookmarks) {
   std::vector<BookmarkNode> merged_other;
   std::vector<BookmarkNode> merged_synced;
   std::wstring other_title = L"其他书签";
+  BookmarkSource default_source = BookmarkSource::kLocal;
   BookmarkSource other_default_source = BookmarkSource::kLocal;
   bool any_parsed = false;
 
@@ -1582,6 +2192,9 @@ bool BookmarkModel::EnsureLoaded(bool show_other_bookmarks) {
     TagNodeSourceRecursive(roots.other, src);
     TagNodeSourceRecursive(roots.synced, src);
 
+    if (!roots.bookmark_bar.children.empty()) {
+      default_source = src;
+    }
     for (auto& n : roots.bookmark_bar.children) {
       items->push_back(std::move(n));
     }
@@ -1614,6 +2227,13 @@ bool BookmarkModel::EnsureLoaded(bool show_other_bookmarks) {
     return false;
   }
 
+  // Always replay Chrome++'s durable edit journal on top of Chrome's files so
+  // Chrome's in-memory BookmarkStorage / Sync never reverts user edits.
+  const std::vector<BookmarkOp> journal_ops = LoadJournalFromDisk(*profile_dir);
+  if (!journal_ops.empty()) {
+    ApplyOpsToInMemoryTree(*items, merged_other, default_source, journal_ops);
+  }
+
   if (show_other_bookmarks && !merged_other.empty()) {
     BookmarkNode other_folder;
     other_folder.id = L"__other__";
@@ -1641,14 +2261,18 @@ bool BookmarkModel::EnsureLoaded(bool show_other_bookmarks) {
   return true;
 }
 
-bool BookmarkModel::MoveBookmark(BookmarkSource src_source,
+bool BookmarkModel::MoveBookmark(BookmarkSource /*src_source*/,
                                  const std::wstring& src_id,
-                                 BookmarkSource dst_source,
+                                 const std::wstring& src_guid,
+                                 BookmarkSource /*dst_source*/,
                                  const std::wstring& dst_folder_id,
+                                 const std::wstring& dst_folder_guid,
                                  const std::wstring& anchor_id,
+                                 const std::wstring& anchor_guid,
                                  bool insert_after,
                                  bool show_other_bookmarks) {
-  if (src_id.empty() || src_id == L"__other__" || src_id == L"__empty__") {
+  if ((src_id.empty() && src_guid.empty()) || src_id == L"__other__" ||
+      src_id == L"__empty__") {
     return false;
   }
 
@@ -1662,123 +2286,36 @@ bool BookmarkModel::MoveBookmark(BookmarkSource src_source,
     return false;
   }
 
-  const std::string src_id_u8 = WideToUtf8(src_id);
-  const std::string dst_folder_u8 = WideToUtf8(dst_folder_id);
-  const std::string anchor_u8 = WideToUtf8(anchor_id);
+  BookmarkOp op;
+  op.kind = BookmarkOp::Kind::kMove;
+  op.id = WideToUtf8(src_id);
+  op.guid = WideToUtf8(src_guid);
+  op.dst_folder_id = WideToUtf8(dst_folder_id);
+  op.dst_folder_guid = WideToUtf8(dst_folder_guid);
+  op.anchor_id = WideToUtf8(anchor_id);
+  op.anchor_guid = WideToUtf8(anchor_guid);
+  op.insert_after = insert_after;
 
-  const std::wstring src_path = BookmarkSourcePath(profile_dir, src_source);
-  const auto src_text = ReadFileSharedUtf8(src_path, 64 * 1024 * 1024);
-  if (!src_text) {
-    return false;
-  }
-  JsonValue src_doc;
-  AstJsonParser src_parser(*src_text);
-  if (!src_parser.Parse(src_doc)) {
-    return false;
-  }
-
-  const bool same_file = (src_source == dst_source);
-  JsonValue dst_doc_separate;
-  if (!same_file) {
-    const std::wstring dst_path = BookmarkSourcePath(profile_dir, dst_source);
-    const auto dst_text = ReadFileSharedUtf8(dst_path, 64 * 1024 * 1024);
-    if (!dst_text) {
-      return false;
-    }
-    AstJsonParser dst_parser(*dst_text);
-    if (!dst_parser.Parse(dst_doc_separate)) {
-      return false;
-    }
-  }
-  JsonValue& dst_doc = same_file ? src_doc : dst_doc_separate;
-
-  // Verify destination folder exists before modifying anything.
-  if (!ResolveDestinationFolder(dst_doc, dst_folder_u8)) {
+  auto ops = LoadJournalFromDisk(profile_dir);
+  AppendAndCompactOp(ops, std::move(op));
+  if (!SaveJournalToDisk(profile_dir, ops)) {
     return false;
   }
 
-  // Prevent moving a folder into itself or its own descendant.
-  if (same_file && dst_folder_u8 == src_id_u8) {
-    return false;
-  }
-
-  JsonValue moved_node;
-  if (!ExtractNodeFromDoc(src_doc, src_id_u8, moved_node)) {
-    return false;
-  }
-
-  if (same_file && AstContainsNodeId(moved_node, dst_folder_u8)) {
-    return false;
-  }
-
-  JsonValue* dst_folder = ResolveDestinationFolder(dst_doc, dst_folder_u8);
-  if (!dst_folder) {
-    return false;
-  }
-  JsonValue* dst_children = dst_folder->Find("children");
-  if (!dst_children) {
-    JsonValue empty_arr;
-    empty_arr.type = JsonValue::Type::kArray;
-    dst_folder->obj_val.emplace_back("children", std::move(empty_arr));
-    dst_children = dst_folder->Find("children");
-  }
-  if (!dst_children || dst_children->type != JsonValue::Type::kArray) {
-    return false;
-  }
-
-  if (!same_file) {
-    uint64_t max_id = 0;
-    if (const JsonValue* roots = dst_doc.Find("roots")) {
-      for (const char* key : {"bookmark_bar", "other", "synced"}) {
-        if (const JsonValue* r = roots->Find(key)) {
-          FindMaxNumericId(*r, max_id);
-        }
-      }
-    }
-    ReassignSubtreeIds(moved_node, max_id);
-  }
-
-  size_t insert_pos = dst_children->arr_val.size();
-  if (!anchor_u8.empty()) {
-    for (size_t i = 0; i < dst_children->arr_val.size(); ++i) {
-      if (dst_children->arr_val[i].GetString("id") == anchor_u8) {
-        insert_pos = insert_after ? (i + 1) : i;
-        break;
-      }
-    }
-  }
-
-  dst_children->arr_val.insert(
-      dst_children->arr_val.begin() + static_cast<ptrdiff_t>(insert_pos),
-      std::move(moved_node));
-  dst_folder->SetString("date_modified",
-                        std::to_string(GetChromeWebKitTimestamp()));
-
-  bool saved = SaveBookmarkDoc(src_path, src_doc);
-  if (saved && !same_file) {
-    const std::wstring dst_path = BookmarkSourcePath(profile_dir, dst_source);
-    saved = SaveBookmarkDoc(dst_path, dst_doc);
-  }
-  if (!saved) {
-    return false;
-  }
-
-  // Force immediate reload into memory.
-  {
-    auto& store = GetStore();
-    std::lock_guard lock(store.mutex);
-    store.bookmarks_stamp = CombinedBookmarkStamp{};
-  }
-  EnsureLoaded(show_other_bookmarks);
+  // Best-effort mirror to Chrome's own Bookmarks/AccountBookmarks files.
+  FlushJournalToProfileFiles(profile_dir, ops);
+  EnsureLoaded(show_other_bookmarks, /*force=*/true);
   return true;
 }
 
-bool BookmarkModel::UpdateBookmark(BookmarkSource source,
+bool BookmarkModel::UpdateBookmark(BookmarkSource /*source*/,
                                    const std::wstring& node_id,
+                                   const std::wstring& node_guid,
                                    const std::wstring& new_title,
                                    const std::optional<std::wstring>& new_url,
                                    bool show_other_bookmarks) {
-  if (node_id.empty() || node_id == L"__other__" || node_id == L"__empty__") {
+  if ((node_id.empty() && node_guid.empty()) || node_id == L"__other__" ||
+      node_id == L"__empty__") {
     return false;
   }
 
@@ -1792,51 +2329,32 @@ bool BookmarkModel::UpdateBookmark(BookmarkSource source,
     return false;
   }
 
-  const std::wstring path = BookmarkSourcePath(profile_dir, source);
-  const auto text = ReadFileSharedUtf8(path, 64 * 1024 * 1024);
-  if (!text) {
-    return false;
-  }
-  JsonValue doc;
-  AstJsonParser parser(*text);
-  if (!parser.Parse(doc)) {
-    return false;
-  }
-
-  JsonValue* parent = nullptr;
-  JsonValue* node = FindNodeByIdInDoc(doc, WideToUtf8(node_id), &parent);
-  if (!node) {
-    return false;
+  BookmarkOp op;
+  op.kind = BookmarkOp::Kind::kUpdate;
+  op.id = WideToUtf8(node_id);
+  op.guid = WideToUtf8(node_guid);
+  op.title = WideToUtf8(new_title);
+  op.has_url = new_url.has_value();
+  if (new_url.has_value()) {
+    op.url = WideToUtf8(*new_url);
   }
 
-  node->SetString("name", WideToUtf8(new_title));
-  if (new_url.has_value() && node->GetString("type") == "url") {
-    node->SetString("url", WideToUtf8(*new_url));
-  }
-  const std::string now_ts = std::to_string(GetChromeWebKitTimestamp());
-  if (node->GetString("type") == "folder") {
-    node->SetString("date_modified", now_ts);
-  }
-  if (parent) {
-    parent->SetString("date_modified", now_ts);
-  }
-
-  if (!SaveBookmarkDoc(path, doc)) {
+  auto ops = LoadJournalFromDisk(profile_dir);
+  AppendAndCompactOp(ops, std::move(op));
+  if (!SaveJournalToDisk(profile_dir, ops)) {
     return false;
   }
 
-  {
-    auto& store = GetStore();
-    std::lock_guard lock(store.mutex);
-    store.bookmarks_stamp = CombinedBookmarkStamp{};
-  }
-  EnsureLoaded(show_other_bookmarks);
+  FlushJournalToProfileFiles(profile_dir, ops);
+  EnsureLoaded(show_other_bookmarks, /*force=*/true);
   return true;
 }
 
 bool BookmarkModel::AddBookmarkOrFolder(BookmarkSource dst_source,
                                         const std::wstring& dst_folder_id,
+                                        const std::wstring& dst_folder_guid,
                                         const std::wstring& anchor_id,
+                                        const std::wstring& anchor_guid,
                                         bool insert_after,
                                         bool is_folder,
                                         const std::wstring& title,
@@ -1856,98 +2374,43 @@ bool BookmarkModel::AddBookmarkOrFolder(BookmarkSource dst_source,
     return false;
   }
 
-  const std::wstring path = BookmarkSourcePath(profile_dir, dst_source);
-  const auto text = ReadFileSharedUtf8(path, 64 * 1024 * 1024);
-  if (!text) {
-    return false;
-  }
-  JsonValue doc;
-  AstJsonParser parser(*text);
-  if (!parser.Parse(doc)) {
-    return false;
-  }
+  static std::atomic<uint32_t> add_seq{0};
+  const std::string new_guid = GenerateUuidV4();
+  const std::string new_id =
+      "cp_" + std::to_string(::GetTickCount64()) + "_" +
+      std::to_string(++add_seq);
 
-  JsonValue* dst_folder =
-      ResolveDestinationFolder(doc, WideToUtf8(dst_folder_id));
-  if (!dst_folder) {
-    return false;
-  }
-  JsonValue* dst_children = dst_folder->Find("children");
-  if (!dst_children) {
-    JsonValue empty_arr;
-    empty_arr.type = JsonValue::Type::kArray;
-    dst_folder->obj_val.emplace_back("children", std::move(empty_arr));
-    dst_children = dst_folder->Find("children");
-  }
-  if (!dst_children || dst_children->type != JsonValue::Type::kArray) {
-    return false;
-  }
+  BookmarkOp op;
+  op.kind = BookmarkOp::Kind::kAdd;
+  op.dst_source = dst_source;
+  op.id = new_id;
+  op.guid = new_guid;
+  op.dst_folder_id = WideToUtf8(dst_folder_id);
+  op.dst_folder_guid = WideToUtf8(dst_folder_guid);
+  op.anchor_id = WideToUtf8(anchor_id);
+  op.anchor_guid = WideToUtf8(anchor_guid);
+  op.insert_after = insert_after;
+  op.is_folder = is_folder;
+  op.title = WideToUtf8(title.empty() ? url : title);
+  op.url = WideToUtf8(url);
 
-  uint64_t max_id = 0;
-  if (const JsonValue* roots = doc.Find("roots")) {
-    for (const char* key : {"bookmark_bar", "other", "synced"}) {
-      if (const JsonValue* r = roots->Find(key)) {
-        FindMaxNumericId(*r, max_id);
-      }
-    }
-  }
-
-  const std::string now_ts = std::to_string(GetChromeWebKitTimestamp());
-  JsonValue new_node;
-  new_node.type = JsonValue::Type::kObject;
-  if (is_folder) {
-    JsonValue empty_arr;
-    empty_arr.type = JsonValue::Type::kArray;
-    new_node.obj_val.emplace_back("children", std::move(empty_arr));
-    new_node.SetString("date_added", now_ts);
-    new_node.SetString("date_last_used", "0");
-    new_node.SetString("date_modified", now_ts);
-    new_node.SetString("guid", GenerateUuidV4());
-    new_node.SetString("id", std::to_string(max_id + 1));
-    new_node.SetString("name", WideToUtf8(title));
-    new_node.SetString("type", "folder");
-  } else {
-    new_node.SetString("date_added", now_ts);
-    new_node.SetString("date_last_used", "0");
-    new_node.SetString("guid", GenerateUuidV4());
-    new_node.SetString("id", std::to_string(max_id + 1));
-    new_node.SetString("name", WideToUtf8(title.empty() ? url : title));
-    new_node.SetString("type", "url");
-    new_node.SetString("url", WideToUtf8(url));
-  }
-
-  const std::string anchor_u8 = WideToUtf8(anchor_id);
-  size_t insert_pos = dst_children->arr_val.size();
-  if (!anchor_u8.empty()) {
-    for (size_t i = 0; i < dst_children->arr_val.size(); ++i) {
-      if (dst_children->arr_val[i].GetString("id") == anchor_u8) {
-        insert_pos = insert_after ? (i + 1) : i;
-        break;
-      }
-    }
-  }
-  dst_children->arr_val.insert(
-      dst_children->arr_val.begin() + static_cast<ptrdiff_t>(insert_pos),
-      std::move(new_node));
-  dst_folder->SetString("date_modified", now_ts);
-
-  if (!SaveBookmarkDoc(path, doc)) {
+  auto ops = LoadJournalFromDisk(profile_dir);
+  AppendAndCompactOp(ops, std::move(op));
+  if (!SaveJournalToDisk(profile_dir, ops)) {
     return false;
   }
 
-  {
-    auto& store = GetStore();
-    std::lock_guard lock(store.mutex);
-    store.bookmarks_stamp = CombinedBookmarkStamp{};
-  }
-  EnsureLoaded(show_other_bookmarks);
+  FlushJournalToProfileFiles(profile_dir, ops);
+  EnsureLoaded(show_other_bookmarks, /*force=*/true);
   return true;
 }
 
-bool BookmarkModel::DeleteBookmark(BookmarkSource source,
+bool BookmarkModel::DeleteBookmark(BookmarkSource /*source*/,
                                    const std::wstring& node_id,
+                                   const std::wstring& node_guid,
                                    bool show_other_bookmarks) {
-  if (node_id.empty() || node_id == L"__other__" || node_id == L"__empty__") {
+  if ((node_id.empty() && node_guid.empty()) || node_id == L"__other__" ||
+      node_id == L"__empty__") {
     return false;
   }
 
@@ -1961,33 +2424,36 @@ bool BookmarkModel::DeleteBookmark(BookmarkSource source,
     return false;
   }
 
-  const std::wstring path = BookmarkSourcePath(profile_dir, source);
-  const auto text = ReadFileSharedUtf8(path, 64 * 1024 * 1024);
-  if (!text) {
-    return false;
-  }
-  JsonValue doc;
-  AstJsonParser parser(*text);
-  if (!parser.Parse(doc)) {
+  BookmarkOp op;
+  op.kind = BookmarkOp::Kind::kDelete;
+  op.id = WideToUtf8(node_id);
+  op.guid = WideToUtf8(node_guid);
+
+  auto ops = LoadJournalFromDisk(profile_dir);
+  AppendAndCompactOp(ops, std::move(op));
+  if (!SaveJournalToDisk(profile_dir, ops)) {
     return false;
   }
 
-  JsonValue removed;
-  if (!ExtractNodeFromDoc(doc, WideToUtf8(node_id), removed)) {
-    return false;
-  }
+  FlushJournalToProfileFiles(profile_dir, ops);
+  EnsureLoaded(show_other_bookmarks, /*force=*/true);
+  return true;
+}
 
-  if (!SaveBookmarkDoc(path, doc)) {
-    return false;
-  }
-
+void BookmarkModel::FlushPendingOpsToChromeFiles() {
+  std::wstring profile_dir;
   {
     auto& store = GetStore();
     std::lock_guard lock(store.mutex);
-    store.bookmarks_stamp = CombinedBookmarkStamp{};
+    profile_dir = store.profile_dir;
   }
-  EnsureLoaded(show_other_bookmarks);
-  return true;
+  if (profile_dir.empty()) {
+    return;
+  }
+  const auto ops = LoadJournalFromDisk(profile_dir);
+  if (!ops.empty()) {
+    FlushJournalToProfileFiles(profile_dir, ops);
+  }
 }
 
 std::wstring BookmarkModel::GetDiagnosticInfo() const {
