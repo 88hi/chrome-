@@ -15,8 +15,10 @@
 extern HMODULE hInstance;
 
 // Constants
+// Distinct from MouseInc's dwExtraInfo magic code (0x1603ABD9) so right-clicks
+// replayed by MouseInc are not ignored by Chrome++'s mouse hook.
 consteval uint32_t GetMagicCode() {
-  return 0x1603ABD9;
+  return 0x43505021;
 }
 
 // Chrome command IDs
