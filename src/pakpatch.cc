@@ -290,7 +290,7 @@ struct PakCacheHeader {
   uint64_t entry_hash;
 };
 
-constexpr uint32_t kPakCacheMagic = 0x43505044;
+constexpr uint32_t kPakCacheMagic = 0x43505045;
 constexpr wchar_t kPakCacheName[] = L"Chrome++_PakCache.bin";
 // The patched bytes embed the build's version and architecture.
 constexpr char kPatchBuild[] = RELEASE_VER_STR BUILD_ARCH;

@@ -24,8 +24,8 @@
 
 namespace {
 
-constexpr uint16_t kSettingsPort = 48321;
-constexpr std::string_view kExpectedHost = "127.0.0.1:48321";
+constexpr uint16_t kSettingsPort = 19876;
+constexpr std::string_view kExpectedHost = "127.0.0.1:19876";
 
 std::string g_session_token;
 
@@ -910,39 +910,63 @@ void HandleClient(SOCKET client) {
 }  // namespace
 
 void StartSettingsServer() {
-  WSADATA wsa{};
-  if (::WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-    return;
-  }
-
-  SOCKET listen_sock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if (listen_sock == INVALID_SOCKET) {
-    return;
-  }
-
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  addr.sin_port = htons(kSettingsPort);
-
-  if (::bind(listen_sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) ==
-      SOCKET_ERROR) {
-    ::closesocket(listen_sock);
-    return;
-  }
-
-  if (::listen(listen_sock, SOMAXCONN) == SOCKET_ERROR) {
-    ::closesocket(listen_sock);
-    return;
-  }
-
   g_session_token = GenerateSessionToken();
-  DebugLog(L"SettingsServer: listening on http://127.0.0.1:{}", kSettingsPort);
 
-  std::thread([listen_sock] {
+  std::thread([] {
+    WSADATA wsa{};
+    if (::WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+      return;
+    }
+
+    SOCKET listen_sock = INVALID_SOCKET;
+    for (int attempt = 0; attempt < 30; ++attempt) {
+      listen_sock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+      if (listen_sock == INVALID_SOCKET) {
+        ::Sleep(300);
+        continue;
+      }
+
+      const BOOL reuse = TRUE;
+      ::setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR,
+                   reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+
+      sockaddr_in addr{};
+      addr.sin_family = AF_INET;
+      addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      addr.sin_port = htons(kSettingsPort);
+
+      if (::bind(listen_sock, reinterpret_cast<sockaddr*>(&addr),
+                 sizeof(addr)) == 0 &&
+          ::listen(listen_sock, SOMAXCONN) == 0) {
+        break;
+      }
+
+      const int err = ::WSAGetLastError();
+      ::closesocket(listen_sock);
+      listen_sock = INVALID_SOCKET;
+      // Retry when the previous Chrome instance is still shutting down.
+      if (err == WSAEADDRINUSE) {
+        ::Sleep(300);
+        continue;
+      }
+      DebugLog(L"SettingsServer: bind/listen failed on port {} (WSA error {})",
+               kSettingsPort, err);
+      return;
+    }
+
+    if (listen_sock == INVALID_SOCKET) {
+      return;
+    }
+
+    DebugLog(L"SettingsServer: listening on http://127.0.0.1:{}", kSettingsPort);
+
     while (true) {
       SOCKET client = ::accept(listen_sock, nullptr, nullptr);
       if (client == INVALID_SOCKET) {
+        const int err = ::WSAGetLastError();
+        if (err == WSAEINTR || err == WSAEWOULDBLOCK || err == WSAECONNRESET) {
+          continue;
+        }
         break;
       }
       HandleClient(client);

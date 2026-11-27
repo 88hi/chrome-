@@ -7,9 +7,9 @@
 // Must be called in the browser process.
 void StartSettingsServer();
 
-// Returns the fixed loopback URL (http://127.0.0.1:48321/) for the settings UI.
+// Returns the fixed loopback URL (http://127.0.0.1:19876/) for the settings UI.
 constexpr std::string_view GetSettingsServerUrl() {
-  return "http://127.0.0.1:48321/";
+  return "http://127.0.0.1:19876/";
 }
 
 #endif  // CHROME_PLUS_SRC_SETTINGS_SERVER_H_
