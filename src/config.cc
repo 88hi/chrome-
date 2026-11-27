@@ -73,6 +73,8 @@ void Config::ReloadTabsConfig() {
                           std::memory_order_relaxed);
   new_tab_disable_.store(GetIniInt(L"tabs", L"new_tab_disable", 1) != 0,
                          std::memory_order_relaxed);
+  super_drag_.store(GetIniInt(L"tabs", L"super_drag", 1) != 0,
+                    std::memory_order_relaxed);
 }
 
 void Config::LoadKeyMappings() {

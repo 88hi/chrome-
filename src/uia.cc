@@ -1325,6 +1325,50 @@ bool IsOmniboxFocused() {
   return HasClassName(focused, {L"OmniboxViewViews", L"OmniboxResultView"});
 }
 
+bool SetOmniboxText(const std::wstring& text) {
+  const HWND focus = GetFocus();
+  std::array<wchar_t, 64> focus_class{};
+  if (!focus ||
+      !GetClassNameW(focus, focus_class.data(),
+                     static_cast<int>(focus_class.size())) ||
+      std::wstring_view(focus_class.data()) == L"Chrome_RenderWidgetHostHWND") {
+    return false;
+  }
+
+  const UiaSession* session = GetUiaSession();
+  if (!session) {
+    return false;
+  }
+
+  const auto focused = GetFocusedElement(*session);
+  if (!focused ||
+      !HasClassName(focused, {L"OmniboxViewViews", L"OmniboxResultView"})) {
+    return false;
+  }
+
+  ComPtr<IUnknown> pattern;
+  if (FAILED(focused->GetCurrentPattern(UIA_ValuePatternId,
+                                        pattern.ReleaseAndGetAddressOf())) ||
+      !pattern) {
+    return false;
+  }
+
+  ComPtr<IUIAutomationValuePattern> value_pattern;
+  if (FAILED(pattern->QueryInterface(
+          IID_PPV_ARGS(value_pattern.ReleaseAndGetAddressOf()))) ||
+      !value_pattern) {
+    return false;
+  }
+
+  BSTR bstr = SysAllocStringLen(text.data(), static_cast<UINT>(text.size()));
+  if (!bstr) {
+    return false;
+  }
+  const HRESULT hr = value_pattern->SetValue(bstr);
+  SysFreeString(bstr);
+  return SUCCEEDED(hr);
+}
+
 bool IsOnNewTab(HWND hwnd, const std::vector<std::wstring>& extra_tab_names) {
   UiaSession* session = GetUiaSession();
   if (!session) {

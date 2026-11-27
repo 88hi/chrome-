@@ -24,6 +24,7 @@ bool SelectTab(const TabHitResult& hit_result);
 [[nodiscard]] bool IsOnNewTabButton(POINT pt);
 [[nodiscard]] bool IsOnBookmark(POINT pt);
 [[nodiscard]] bool IsOmniboxFocused();
+[[nodiscard]] bool SetOmniboxText(const std::wstring& text);
 [[nodiscard]] bool IsOnNewTab(HWND hwnd,
                               const std::vector<std::wstring>& extra_tab_names);
 

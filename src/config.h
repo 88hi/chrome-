@@ -72,6 +72,9 @@ class Config {
   bool IsNewTabDisable() const {
     return new_tab_disable_.load(std::memory_order_relaxed);
   }
+  bool IsSuperDrag() const {
+    return super_drag_.load(std::memory_order_relaxed);
+  }
   const std::vector<std::wstring>& GetDisableTabNames() const {
     return disable_tab_names_;
   }
@@ -124,6 +127,7 @@ class Config {
   std::atomic<int> open_url_new_tab_;
   std::atomic<int> bookmark_new_tab_;
   std::atomic<bool> new_tab_disable_;
+  std::atomic<bool> super_drag_;
   std::vector<std::wstring> disable_tab_names_;
 
   // keymapping

@@ -1,0 +1,6 @@
+#ifndef CHROME_PLUS_SRC_SUPERDRAG_H_
+#define CHROME_PLUS_SRC_SUPERDRAG_H_
+
+void SuperDrag();
+
+#endif  // CHROME_PLUS_SRC_SUPERDRAG_H_

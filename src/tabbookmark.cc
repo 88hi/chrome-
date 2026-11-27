@@ -5,6 +5,9 @@
 #include <cstdlib>
 #include <cwctype>
 #include <optional>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "config.h"
 #include "inputhook.h"
@@ -48,6 +51,7 @@ enum class ClipboardNewTabStage {
 HWND clipboard_new_tab_root = nullptr;
 ClipboardNewTabStage clipboard_new_tab_stage = ClipboardNewTabStage::kIdle;
 std::optional<int> clipboard_new_tab_initial_count;
+std::optional<std::wstring> clipboard_new_tab_text;
 int clipboard_new_tab_polls = 0;
 bool suppress_next_open_url_new_tab = false;
 
@@ -323,6 +327,27 @@ bool HasClipboardText() {
   return has_text;
 }
 
+void SendUnicodeText(const std::wstring& text) {
+  if (text.empty()) {
+    return;
+  }
+  std::vector<INPUT> inputs;
+  inputs.reserve(text.size() * 2);
+  for (wchar_t ch : text) {
+    INPUT down = {};
+    down.type = INPUT_KEYBOARD;
+    down.ki.wScan = static_cast<WORD>(ch);
+    down.ki.dwFlags = KEYEVENTF_UNICODE;
+    down.ki.dwExtraInfo = GetMagicCode();
+    inputs.push_back(down);
+
+    INPUT up = down;
+    up.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+    inputs.push_back(up);
+  }
+  ::SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT));
+}
+
 void CancelClipboardNewTabTimer() {
   if (clipboard_new_tab_root) {
     KillTimer(clipboard_new_tab_root, kClipboardNewTabTimerId);
@@ -330,6 +355,7 @@ void CancelClipboardNewTabTimer() {
   }
   clipboard_new_tab_stage = ClipboardNewTabStage::kIdle;
   clipboard_new_tab_initial_count.reset();
+  clipboard_new_tab_text.reset();
   clipboard_new_tab_polls = 0;
 }
 
@@ -362,7 +388,14 @@ void CALLBACK ClipboardNewTabTimerProc(HWND hwnd,
       return;
     }
 
-    SendKey({VK_CONTROL, 'V'});
+    if (clipboard_new_tab_text.has_value()) {
+      if (!SetOmniboxText(*clipboard_new_tab_text)) {
+        SendUnicodeText(*clipboard_new_tab_text);
+      }
+      clipboard_new_tab_text.reset();
+    } else {
+      SendKey({VK_CONTROL, 'V'});
+    }
     clipboard_new_tab_stage = ClipboardNewTabStage::kWaitingToSubmit;
     if (!SetTimer(hwnd, kClipboardNewTabTimerId, kClipboardNewTabSubmitDelayMs,
                   ClipboardNewTabTimerProc)) {
@@ -371,13 +404,34 @@ void CALLBACK ClipboardNewTabTimerProc(HWND hwnd,
     return;
   }
 
-  // `kWaitingToSubmit`: submit the pasted URL or search query in the omnibox.
+  // `kWaitingToSubmit`: submit the pasted/set URL or search query in the
+  // omnibox.
   CancelClipboardNewTabTimer();
   if (!IsOmniboxFocused()) {
     return;
   }
   suppress_next_open_url_new_tab = true;
   SendKey({VK_RETURN});
+}
+
+void StartNewTabNavigation(HWND root, std::optional<std::wstring> text) {
+  if (!root) {
+    return;
+  }
+
+  CancelClipboardNewTabTimer();
+  clipboard_new_tab_initial_count = FindTabCount(root);
+  clipboard_new_tab_text = std::move(text);
+  clipboard_new_tab_polls = 0;
+  clipboard_new_tab_stage = ClipboardNewTabStage::kWaitingForNewTab;
+
+  ExecuteCommand(IDC_NEW_TAB, root);
+  if (SetTimer(root, kClipboardNewTabTimerId, kClipboardNewTabPollMs,
+               ClipboardNewTabTimerProc)) {
+    clipboard_new_tab_root = root;
+  } else {
+    CancelClipboardNewTabTimer();
+  }
 }
 
 // Right-click the New Tab (+) button to open clipboard text as a URL or search
@@ -397,18 +451,7 @@ bool HandleRightClickNewTabButton(const MOUSEHOOKSTRUCT* pmouse) {
     return false;
   }
 
-  CancelClipboardNewTabTimer();
-  clipboard_new_tab_initial_count = FindTabCount(root);
-  clipboard_new_tab_polls = 0;
-  clipboard_new_tab_stage = ClipboardNewTabStage::kWaitingForNewTab;
-
-  ExecuteCommand(IDC_NEW_TAB, root);
-  if (SetTimer(root, kClipboardNewTabTimerId, kClipboardNewTabPollMs,
-               ClipboardNewTabTimerProc)) {
-    clipboard_new_tab_root = root;
-  } else {
-    CancelClipboardNewTabTimer();
-  }
+  StartNewTabNavigation(root, std::nullopt);
   return true;
 }
 
@@ -735,4 +778,11 @@ bool TabBookmarkKeyboardHandler(WPARAM wParam, LPARAM lParam) {
 void TabBookmark() {
   RegisterMouseHandler(TabBookmarkMouseHandler, HandlerPriority::kNormal);
   RegisterKeyboardHandler(TabBookmarkKeyboardHandler, HandlerPriority::kNormal);
+}
+
+void OpenInNewTab(HWND root, std::wstring text) {
+  if (!root || text.empty()) {
+    return;
+  }
+  StartNewTabNavigation(root, std::move(text));
 }

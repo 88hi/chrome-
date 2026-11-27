@@ -20,6 +20,7 @@
 #include "policies.h"
 #include "portable.h"
 #include "settings_server.h"
+#include "superdrag.h"
 #include "tabbookmark.h"
 #include "update.h"
 #include "upgradenotification.h"
@@ -48,6 +49,9 @@ void ChromePlus() {
 
   // Enhancement of the address bar, tab, and bookmark.
   TabBookmark();
+
+  // Super Drag (drag text to search, drag links to open in new tab).
+  SuperDrag();
 
   // Install input hooks (must be called after all handlers are registered).
   InstallInputHooks();

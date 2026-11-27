@@ -180,6 +180,7 @@ add_library(chrome_plus SHARED
   src/policies.cc
   src/portable.cc
   src/settings_server.cc
+  src/superdrag.cc
   src/tabbookmark.cc
   src/uia.cc
   src/update.cc
@@ -218,6 +219,7 @@ endif()
 target_link_libraries(chrome_plus PRIVATE
   onecore
   propsys
+  ole32
   ws2_32
   bcrypt
   detours
