@@ -212,13 +212,16 @@ bool PatchSettingsHtml(uint8_t* begin, uint32_t size, size_t& new_len) {
                        R"(hidden="true")");
 
   std::string product_title =
-      R"({aboutBrowserVersion}</div><div class="secondary">Powered by <a target="_blank" href="https://github.com/Bush2021/chrome_plus">Chrome++ Next</a> )" RELEASE_VER_STR BUILD_ARCH;
+      R"({aboutBrowserVersion}</div><div class="secondary">Powered by )";
   if (const std::string& settings_url = GetSettingsServerUrl();
       !settings_url.empty()) {
-    product_title += R"( · <a target="_blank" href=")" + settings_url +
-                     R"(">Chrome++ 设置</a>)";
+    product_title += R"(<a target="_blank" href=")" + settings_url +
+                     R"(">Chrome++ 设置</a> )";
+  } else {
+    product_title +=
+        R"(<a target="_blank" href="https://github.com/Bush2021/chrome_plus">Chrome++ Next</a> )";
   }
-  product_title += R"(</div>)";
+  product_title += RELEASE_VER_STR BUILD_ARCH R"(</div>)";
   ReplaceStringInPlace(html, R"({aboutBrowserVersion}</div>)", product_title);
 
   if (html.length() > size) {

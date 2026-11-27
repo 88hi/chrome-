@@ -24,6 +24,8 @@
 
 namespace {
 
+constexpr wchar_t kSettingsUrlEnv[] = L"CHROME_PLUS_SETTINGS_URL";
+
 std::string g_settings_url;
 std::string g_session_token;
 std::string g_expected_host;
@@ -60,11 +62,11 @@ std::wstring Utf8ToWide(std::string_view utf8) {
 }
 
 std::string GenerateSessionToken() {
-  std::array<uint8_t, 8> bytes{};
+  std::array<uint8_t, 4> bytes{};
   if (::BCryptGenRandom(nullptr, bytes.data(), static_cast<ULONG>(bytes.size()),
                         BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
-    const uint64_t fallback =
-        (::GetTickCount64() << 16) ^ static_cast<uint64_t>(::GetCurrentProcessId());
+    const uint32_t fallback =
+        static_cast<uint32_t>(::GetTickCount64()) ^ ::GetCurrentProcessId();
     memcpy(bytes.data(), &fallback, sizeof(fallback));
   }
   constexpr char kHex[] = "0123456789abcdef";
@@ -647,7 +649,8 @@ input[type=checkbox]{width:18px;height:18px;accent-color:var(--accent);cursor:po
 </main>
 <div id="toast"></div>
 <script>
-const token = new URLSearchParams(location.search).get('token') || '';
+const sp = new URLSearchParams(location.search);
+const token = sp.get('t') || sp.get('token') || '';
 const $ = id => document.getElementById(id);
 const toast = msg => {
   const el = $('toast');
@@ -801,6 +804,9 @@ std::string_view ExtractQueryToken(std::string_view target) {
     const size_t amp = query.find('&');
     const std::string_view part =
         amp == std::string_view::npos ? query : query.substr(0, amp);
+    if (part.starts_with("t=")) {
+      return part.substr(2);
+    }
     if (part.starts_with("token=")) {
       return part.substr(6);
     }
@@ -968,7 +974,8 @@ void StartSettingsServer() {
   const uint16_t port = ntohs(addr.sin_port);
   g_session_token = GenerateSessionToken();
   g_expected_host = "127.0.0.1:" + std::to_string(port);
-  g_settings_url = "http://" + g_expected_host + "/?token=" + g_session_token;
+  g_settings_url = "http://" + g_expected_host + "/?t=" + g_session_token;
+  ::SetEnvironmentVariableW(kSettingsUrlEnv, Utf8ToWide(g_settings_url).c_str());
 
   DebugLog(L"SettingsServer: listening on {}", Utf8ToWide(g_settings_url));
 
@@ -985,5 +992,13 @@ void StartSettingsServer() {
 }
 
 const std::string& GetSettingsServerUrl() {
+  if (g_settings_url.empty()) {
+    wchar_t value[128] = {};
+    const DWORD len =
+        ::GetEnvironmentVariableW(kSettingsUrlEnv, value, ARRAYSIZE(value));
+    if (len > 0 && len < ARRAYSIZE(value)) {
+      g_settings_url = WideToUtf8(std::wstring_view(value, len));
+    }
+  }
   return g_settings_url;
 }
