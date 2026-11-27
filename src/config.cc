@@ -33,25 +33,45 @@ void Config::LoadConfig() {
       GetIniInt(L"general", L"suppress_false_upgrade_notification", 0) != 0;
   managed_updates_ = GetIniInt(L"general", L"managed_updates", 0) != 0;
 
+  // proxy
+  proxy_enabled_ = GetIniInt(L"proxy", L"enabled", 0) != 0;
+  proxy_server_ = GetIniString(L"proxy", L"server", L"");
+  proxy_bypass_list_ =
+      GetIniString(L"proxy", L"bypass_list", L"localhost;127.0.0.1;<local>");
+
   // tabs
-  keep_last_tab_ = GetIniInt(L"tabs", L"keep_last_tab", 1) != 0;
-  double_click_close_ = GetIniInt(L"tabs", L"double_click_close", 1) != 0;
-  right_click_close_ = GetIniInt(L"tabs", L"right_click_close", 1) != 0;
-  right_click_new_tab_clipboard_ =
-      GetIniInt(L"tabs", L"right_click_new_tab_clipboard", 1) != 0;
-  wheel_tab_ = GetIniInt(L"tabs", L"wheel_tab", 1) != 0;
-  wheel_tab_when_press_rbutton_ =
-      GetIniInt(L"tabs", L"wheel_tab_when_press_rbutton", 1) != 0;
-  hover_tab_ = GetIniInt(L"tabs", L"hover_tab", 1) != 0;
-  hover_tab_delay_ = LoadHoverTabDelay();
-  open_url_new_tab_ = GetIniInt(L"tabs", L"open_url_new_tab", 0);
-  bookmark_new_tab_ = GetIniInt(L"tabs", L"open_bookmark_new_tab", 0);
-  new_tab_disable_ = GetIniInt(L"tabs", L"new_tab_disable", 1) != 0;
+  ReloadTabsConfig();
   disable_tab_names_ = StringSplit(
       GetIniString(L"tabs", L"new_tab_disable_name", L""), L',', L"\"");
 
   // keymapping
   LoadKeyMappings();
+}
+
+void Config::ReloadTabsConfig() {
+  keep_last_tab_.store(GetIniInt(L"tabs", L"keep_last_tab", 1) != 0,
+                       std::memory_order_relaxed);
+  double_click_close_.store(GetIniInt(L"tabs", L"double_click_close", 1) != 0,
+                            std::memory_order_relaxed);
+  right_click_close_.store(GetIniInt(L"tabs", L"right_click_close", 1) != 0,
+                           std::memory_order_relaxed);
+  right_click_new_tab_clipboard_.store(
+      GetIniInt(L"tabs", L"right_click_new_tab_clipboard", 1) != 0,
+      std::memory_order_relaxed);
+  wheel_tab_.store(GetIniInt(L"tabs", L"wheel_tab", 1) != 0,
+                   std::memory_order_relaxed);
+  wheel_tab_when_press_rbutton_.store(
+      GetIniInt(L"tabs", L"wheel_tab_when_press_rbutton", 1) != 0,
+      std::memory_order_relaxed);
+  hover_tab_.store(GetIniInt(L"tabs", L"hover_tab", 1) != 0,
+                   std::memory_order_relaxed);
+  hover_tab_delay_.store(LoadHoverTabDelay(), std::memory_order_relaxed);
+  open_url_new_tab_.store(GetIniInt(L"tabs", L"open_url_new_tab", 0),
+                          std::memory_order_relaxed);
+  bookmark_new_tab_.store(GetIniInt(L"tabs", L"open_bookmark_new_tab", 0),
+                          std::memory_order_relaxed);
+  new_tab_disable_.store(GetIniInt(L"tabs", L"new_tab_disable", 1) != 0,
+                         std::memory_order_relaxed);
 }
 
 void Config::LoadKeyMappings() {

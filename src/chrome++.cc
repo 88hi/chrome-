@@ -19,6 +19,7 @@
 #include "pakpatch.h"
 #include "policies.h"
 #include "portable.h"
+#include "settings_server.h"
 #include "tabbookmark.h"
 #include "update.h"
 #include "upgradenotification.h"
@@ -50,6 +51,10 @@ void ChromePlus() {
 
   // Install input hooks (must be called after all handlers are registered).
   InstallInputHooks();
+
+  // Start the local loopback server for the Chrome++ settings panel before
+  // patching resources.pak so its session URL can be embedded.
+  StartSettingsServer();
 
   // Patch the pak file.
   PakPatch();

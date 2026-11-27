@@ -1,6 +1,7 @@
 #ifndef CHROME_PLUS_SRC_CONFIG_H_
 #define CHROME_PLUS_SRC_CONFIG_H_
 
+#include <atomic>
 #include <optional>
 #include <string>
 #include <utility>
@@ -9,6 +10,8 @@
 class Config {
  public:
   static Config& Instance();
+
+  void ReloadTabsConfig();
 
   // general
   const std::wstring& GetCommandLine() const { return command_line_; }
@@ -29,22 +32,45 @@ class Config {
   }
   bool IsManagedUpdates() const { return managed_updates_; }
 
-  // tabs
-  bool IsKeepLastTab() const { return keep_last_tab_; }
-  bool IsDoubleClickClose() const { return double_click_close_; }
-  bool IsRightClickClose() const { return right_click_close_; }
+  // proxy
+  bool IsProxyEnabled() const { return proxy_enabled_; }
+  const std::wstring& GetProxyServer() const { return proxy_server_; }
+  const std::wstring& GetProxyBypassList() const { return proxy_bypass_list_; }
+
+  // tabs (atomic for lock-free hot-reload from the settings UI)
+  bool IsKeepLastTab() const {
+    return keep_last_tab_.load(std::memory_order_relaxed);
+  }
+  bool IsDoubleClickClose() const {
+    return double_click_close_.load(std::memory_order_relaxed);
+  }
+  bool IsRightClickClose() const {
+    return right_click_close_.load(std::memory_order_relaxed);
+  }
   bool IsRightClickNewTabClipboard() const {
-    return right_click_new_tab_clipboard_;
+    return right_click_new_tab_clipboard_.load(std::memory_order_relaxed);
   }
-  bool IsWheelTab() const { return wheel_tab_; }
+  bool IsWheelTab() const {
+    return wheel_tab_.load(std::memory_order_relaxed);
+  }
   bool IsWheelTabWhenPressRightButton() const {
-    return wheel_tab_when_press_rbutton_;
+    return wheel_tab_when_press_rbutton_.load(std::memory_order_relaxed);
   }
-  bool IsHoverTab() const { return hover_tab_; }
-  int GetHoverTabDelay() const { return hover_tab_delay_; }
-  int GetOpenUrlNewTabMode() const { return open_url_new_tab_; }
-  int GetBookmarkNewTabMode() const { return bookmark_new_tab_; }
-  bool IsNewTabDisable() const { return new_tab_disable_; }
+  bool IsHoverTab() const {
+    return hover_tab_.load(std::memory_order_relaxed);
+  }
+  int GetHoverTabDelay() const {
+    return hover_tab_delay_.load(std::memory_order_relaxed);
+  }
+  int GetOpenUrlNewTabMode() const {
+    return open_url_new_tab_.load(std::memory_order_relaxed);
+  }
+  int GetBookmarkNewTabMode() const {
+    return bookmark_new_tab_.load(std::memory_order_relaxed);
+  }
+  bool IsNewTabDisable() const {
+    return new_tab_disable_.load(std::memory_order_relaxed);
+  }
   const std::vector<std::wstring>& GetDisableTabNames() const {
     return disable_tab_names_;
   }
@@ -79,18 +105,23 @@ class Config {
   bool suppress_false_upgrade_notification_;
   bool managed_updates_;
 
+  // proxy
+  bool proxy_enabled_;
+  std::wstring proxy_server_;
+  std::wstring proxy_bypass_list_;
+
   // tabs
-  bool keep_last_tab_;
-  bool double_click_close_;
-  bool right_click_close_;
-  bool right_click_new_tab_clipboard_;
-  bool wheel_tab_;
-  bool wheel_tab_when_press_rbutton_;
-  bool hover_tab_;
-  int hover_tab_delay_;
-  int open_url_new_tab_;
-  int bookmark_new_tab_;
-  bool new_tab_disable_;
+  std::atomic<bool> keep_last_tab_;
+  std::atomic<bool> double_click_close_;
+  std::atomic<bool> right_click_close_;
+  std::atomic<bool> right_click_new_tab_clipboard_;
+  std::atomic<bool> wheel_tab_;
+  std::atomic<bool> wheel_tab_when_press_rbutton_;
+  std::atomic<bool> hover_tab_;
+  std::atomic<int> hover_tab_delay_;
+  std::atomic<int> open_url_new_tab_;
+  std::atomic<int> bookmark_new_tab_;
+  std::atomic<bool> new_tab_disable_;
   std::vector<std::wstring> disable_tab_names_;
 
   // keymapping

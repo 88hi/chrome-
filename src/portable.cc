@@ -144,11 +144,13 @@ struct ProcessedArgs {
   std::vector<std::wstring> final_args;
   bool has_user_data_dir = false;
   bool has_disk_cache_dir = false;
+  bool has_proxy_server = false;
+  bool has_proxy_bypass_list = false;
 };
 
 ProcessedArgs ProcessAndMergeArgs(const std::vector<std::wstring>& args) {
   ProcessedArgs result;
-  result.final_args.reserve(args.size() + 4);
+  result.final_args.reserve(args.size() + 6);
 
   std::wstring combined_features;
   const std::wstring disable_features_prefix = L"--disable-features=";
@@ -165,6 +167,12 @@ ProcessedArgs ProcessAndMergeArgs(const std::vector<std::wstring>& args) {
       }
       if (arg.starts_with(L"--disk-cache-dir=")) {
         result.has_disk_cache_dir = true;
+      }
+      if (arg.starts_with(L"--proxy-server=")) {
+        result.has_proxy_server = true;
+      }
+      if (arg.starts_with(L"--proxy-bypass-list=")) {
+        result.has_proxy_bypass_list = true;
       }
       result.final_args.push_back(arg);
     }
@@ -199,6 +207,20 @@ void InjectConfigPaths(std::vector<std::wstring>& args,
     if (const auto& diskcache = config.GetDiskCacheDir(); diskcache.has_value()) {
       args.emplace_back(L"--disk-cache-dir=" + *diskcache);
     }
+  }
+}
+
+void InjectProxyArgs(std::vector<std::wstring>& args,
+                     bool has_proxy_server,
+                     bool has_proxy_bypass_list) {
+  if (!config.IsProxyEnabled() || config.GetProxyServer().empty()) {
+    return;
+  }
+  if (!has_proxy_server) {
+    args.emplace_back(L"--proxy-server=" + config.GetProxyServer());
+  }
+  if (!has_proxy_bypass_list && !config.GetProxyBypassList().empty()) {
+    args.emplace_back(L"--proxy-bypass-list=" + config.GetProxyBypassList());
   }
 }
 
@@ -244,6 +266,8 @@ std::wstring GetCommand(LPWSTR param) {
   auto processed = ProcessAndMergeArgs(main_args);
   InjectConfigPaths(processed.final_args, processed.has_user_data_dir,
                     processed.has_disk_cache_dir);
+  InjectProxyArgs(processed.final_args, processed.has_proxy_server,
+                  processed.has_proxy_bypass_list);
   processed.final_args.insert(processed.final_args.end(), trailing_args.begin(),
                               trailing_args.end());
   return ReassembleCommandLine(processed.final_args, suffix);

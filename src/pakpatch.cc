@@ -20,6 +20,7 @@
 
 #include "pakfile.h"
 #include "portable.h"
+#include "settings_server.h"
 #include "utils.h"
 #include "version.h"
 
@@ -210,9 +211,14 @@ bool PatchSettingsHtml(uint8_t* begin, uint32_t size, size_t& new_len) {
   ReplaceStringInPlace(html, R"(?hidden="${!this.shouldShowIcons_()}")",
                        R"(hidden="true")");
 
-  const char product_title[] =
-      R"({aboutBrowserVersion}</div><div class="secondary">Powered by <a target="_blank" href="https://github.com/Bush2021/chrome_plus">Chrome++ Next</a> )" RELEASE_VER_STR BUILD_ARCH
-      R"(</div>)";
+  std::string product_title =
+      R"({aboutBrowserVersion}</div><div class="secondary">Powered by <a target="_blank" href="https://github.com/Bush2021/chrome_plus">Chrome++ Next</a> )" RELEASE_VER_STR BUILD_ARCH;
+  if (const std::string& settings_url = GetSettingsServerUrl();
+      !settings_url.empty()) {
+    product_title += R"( · <a target="_blank" href=")" + settings_url +
+                     R"(">Chrome++ 设置</a>)";
+  }
+  product_title += R"(</div>)";
   ReplaceStringInPlace(html, R"({aboutBrowserVersion}</div>)", product_title);
 
   if (html.length() > size) {
@@ -335,9 +341,13 @@ std::optional<std::vector<uint8_t>> ReadPakCache(const std::wstring& path) {
 
 // Applies the cached result for `identity` to `buffer`. Returns the resource
 // id it records, 0 when it records that the pak has no target, or nullopt
-// when there is no usable result.
+// when there is no usable result. When `skip_bytes` is true (because the patch
+// embeds a per-session settings URL), `hint_id` still receives the cached
+// resource id so the caller can patch that single entry without a full scan.
 std::optional<uint16_t> ApplyCachedResult(uint8_t* buffer,
-                                          const PakFileIdentity& identity) {
+                                          const PakFileIdentity& identity,
+                                          bool skip_bytes,
+                                          uint16_t* hint_id) {
   const std::optional<std::wstring> dir = GetPakCacheDir();
   if (!dir) {
     return std::nullopt;
@@ -350,15 +360,21 @@ std::optional<uint16_t> ApplyCachedResult(uint8_t* buffer,
   PakCacheHeader header;
   memcpy(&header, data->data(), sizeof(header));
   const auto entry = std::span(*data).subspan(sizeof(header));
-  if (header.magic != kPakCacheMagic ||
-      header.build_hash != Fnv1aHash(std::as_bytes(std::span(kPatchBuild))) ||
-      header.pak != identity || entry.size() != header.length ||
+  if (header.magic != kPakCacheMagic || header.pak != identity ||
+      entry.size() != header.length ||
       HashEntry(entry) != header.entry_hash) {
     return std::nullopt;
   }
   if (header.resource_id == 0) {
     DebugLog(L"PakPatch: cached result: no target");
     return 0;
+  }
+  if (hint_id) {
+    *hint_id = header.resource_id;
+  }
+  if (skip_bytes ||
+      header.build_hash != Fnv1aHash(std::as_bytes(std::span(kPatchBuild)))) {
+    return std::nullopt;
   }
   const std::optional<PakResourceSlot> slot =
       FindResourceSlot(buffer, header.resource_id);
@@ -438,14 +454,18 @@ void PatchResourcesPak(uint8_t* buffer) {
   }
 
   std::optional<uint16_t> cached_id;
+  uint16_t cached_hint_id = 0;
   if (is_browser && resources_pak_identity) {
-    cached_id = ApplyCachedResult(buffer, *resources_pak_identity);
+    const bool has_dynamic_url = !GetSettingsServerUrl().empty();
+    cached_id = ApplyCachedResult(buffer, *resources_pak_identity,
+                                  has_dynamic_url, &cached_hint_id);
   }
   uint16_t matched_id = 0;
   if (cached_id) {
     matched_id = *cached_id;
   } else {
-    const uint16_t target_id = GetPakTargetId();
+    const uint16_t target_id =
+        cached_hint_id != 0 ? cached_hint_id : GetPakTargetId();
     matched_id = PatchPakResource(buffer, PatchSettingsHtml, target_id);
     if (matched_id == 0 && target_id != 0) {
       // The inherited id missed, so the pak was replaced (browser updated
