@@ -21,7 +21,8 @@ struct PakResourceSlot {
 // target by content and handed its id down (see pakpatch.cc).
 uint16_t PatchPakResource(uint8_t* buffer,
                           std::function<bool(uint8_t*, uint32_t, size_t&)>&& f,
-                          uint16_t target_resource_id = 0);
+                          uint16_t target_resource_id = 0,
+                          size_t min_entry_size = 10 * 1024);
 
 // Locates `resource_id` from the pak index alone -- no decompression.
 std::optional<PakResourceSlot> FindResourceSlot(uint8_t* buffer,

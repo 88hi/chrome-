@@ -5,6 +5,7 @@
 #include <sddl.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
@@ -34,27 +35,14 @@ namespace {
 #endif
 
 HANDLE resources_pak_map = nullptr;
+std::atomic<bool> g_bookmarks_pak_patched{false};
 
 auto RawCreateFileMapping = CreateFileMappingW;
 auto RawMapViewOfFile = MapViewOfFile;
 
-// `PakPatch()` runs in the browser and in every renderer (see the loader in
-// chrome++.cc: with in-process WebUI resource loading the renderer serves
-// `chrome://settings` from its own pak mapping, so it must patch that mapping
-// itself). Re-running the content scan in each renderer decompressed every
-// entry up to the target and recompressed the patched one, on the
-// renderer main thread during `PreSandboxStartup` -- a freeze on every new
-// tab and cross-site navigation. Instead the browser scans once and hands the
-// result to its children through two inherited environment variables: the
-// target's pak resource id, so a renderer that has to decompress handles
-// exactly one entry, and the name of a read-only section holding the
-// browser's already-patched entry, which a renderer applies with a single
-// memcpy and no decompression at all.
-constexpr wchar_t kPakTargetIdEnv[] = L"CHROME_PLUS_PAK_RES_ID";
-constexpr wchar_t kPakBlobEnv[] = L"CHROME_PLUS_PAK_BLOB";
 // The browser sets the id variable to this when its pak has no target, as in a
-// Chromium fork without the about page, so its renderers, which map the same
-// pak, skip the scan instead of each repeating it in full.
+// Chromium fork without the page, so its renderers, which map the same pak,
+// skip the scan instead of each repeating it in full.
 constexpr wchar_t kPakTargetMissing[] = L"none";
 
 struct PakBlobHeader {
@@ -62,9 +50,21 @@ struct PakBlobHeader {
   uint32_t length;
 };
 
-// Keeps the published section alive for the browser's lifetime so child
-// processes can open it by name.
-[[maybe_unused]] HANDLE published_blob_section = nullptr;
+using PatchFn = bool (*)(uint8_t*, uint32_t, size_t&);
+
+struct PakPatchTarget {
+  const wchar_t* id_env;
+  const wchar_t* blob_env;
+  const wchar_t* section_prefix;
+  const wchar_t* cache_name;
+  const char* build_tag;
+  size_t min_entry_size;
+  PatchFn patch_fn;
+};
+
+// Keeps published sections alive for the browser's lifetime so child processes
+// can open them by name.
+[[maybe_unused]] HANDLE published_blob_sections[2] = {nullptr, nullptr};
 
 // The loader calls `PakPatch()` only in the browser and in `--type=renderer`
 // children (chrome++.cc `Loader`), so an empty `--type` means the browser.
@@ -72,9 +72,9 @@ bool IsBrowserProcess() {
   return GetSwitchValue(GetCommandLineW(), L"--type").value_or(L"").empty();
 }
 
-uint16_t GetPakTargetId() {
+uint16_t GetPakTargetId(const wchar_t* id_env) {
   wchar_t value[8];
-  DWORD len = GetEnvironmentVariableW(kPakTargetIdEnv, value, ARRAYSIZE(value));
+  DWORD len = GetEnvironmentVariableW(id_env, value, ARRAYSIZE(value));
   if (len == 0 || len >= ARRAYSIZE(value)) {
     return 0;
   }
@@ -86,26 +86,24 @@ uint16_t GetPakTargetId() {
   return static_cast<uint16_t>(id);
 }
 
-bool IsPakTargetMissing() {
+bool IsPakTargetMissing(const wchar_t* id_env) {
   wchar_t value[8];
-  const DWORD len =
-      GetEnvironmentVariableW(kPakTargetIdEnv, value, ARRAYSIZE(value));
+  const DWORD len = GetEnvironmentVariableW(id_env, value, ARRAYSIZE(value));
   return len > 0 && len < ARRAYSIZE(value) &&
          std::wstring_view(value, len) == kPakTargetMissing;
 }
 
 // Browser side: copy the patched slot into a named read-only section and
 // publish the name through the environment. Read-only is load-bearing: the
-// bytes feed the privileged settings WebUI in every renderer, so a writable
-// section would be an HTML injection vector into `chrome://settings`. The
-// DACL grants read to Everyone and to RestrictedCode (the renderer's
-// restricting SID), so a renderer's pre-lockdown token can open the section
-// at the same point it maps the pak.
-void PublishPatchedEntry(uint8_t* buffer, uint16_t resource_id) {
-  // After an in-app restart the new browser inherits the old browser's
-  // section name, which dies with that process; drop it and republish under
-  // this pid.
-  SetEnvironmentVariableW(kPakBlobEnv, nullptr);
+// bytes feed privileged WebUI pages in every renderer, so a writable section
+// would be an injection vector. The DACL grants read to Everyone and to
+// RestrictedCode (the renderer's restricting SID), so a renderer's pre-lockdown
+// token can open the section at the same point it maps the pak.
+void PublishPatchedEntry(uint8_t* buffer,
+                         uint16_t resource_id,
+                         const PakPatchTarget& target,
+                         size_t slot_index) {
+  SetEnvironmentVariableW(target.blob_env, nullptr);
 
   const auto slot = FindResourceSlot(buffer, resource_id);
   if (!slot) {
@@ -120,7 +118,7 @@ void PublishPatchedEntry(uint8_t* buffer, uint16_t resource_id) {
   }
 
   const std::wstring name =
-      L"Local\\ChromePlusPakBlob_" + std::to_wstring(GetCurrentProcessId());
+      std::wstring(target.section_prefix) + std::to_wstring(GetCurrentProcessId());
   const DWORD size = static_cast<DWORD>(sizeof(PakBlobHeader) + slot->length);
   HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE,
                                       0, size, name.c_str());
@@ -129,8 +127,6 @@ void PublishPatchedEntry(uint8_t* buffer, uint16_t resource_id) {
   if (!section) {
     return;
   }
-  // A pre-existing name means another process squatted it; leave children on
-  // the decompress fallback rather than trust its contents.
   if (create_error == ERROR_ALREADY_EXISTS) {
     CloseHandle(section);
     return;
@@ -148,19 +144,19 @@ void PublishPatchedEntry(uint8_t* buffer, uint16_t resource_id) {
   memcpy(view + sizeof(PakBlobHeader), buffer + slot->offset, slot->length);
   UnmapViewOfFile(view);
 
-  published_blob_section = section;
-  SetEnvironmentVariableW(kPakBlobEnv, name.c_str());
+  if (slot_index < std::size(published_blob_sections)) {
+    published_blob_sections[slot_index] = section;
+  }
+  SetEnvironmentVariableW(target.blob_env, name.c_str());
   DebugLog(L"PakPatch: published resource {} ({} bytes) as {}", resource_id,
            slot->length, name);
 }
 
 // Renderer fast path: overwrite this process's copy-on-write pak view with
-// the browser's already-patched bytes. The slot is re-derived from this
-// process's own pak index and the lengths must match, so a section built from
-// a different pak is rejected and the copy cannot write outside the slot.
-bool ApplyPatchedEntry(uint8_t* buffer) {
+// the browser's already-patched bytes.
+bool ApplyPatchedEntry(uint8_t* buffer, const PakPatchTarget& target) {
   wchar_t name[64];
-  DWORD len = GetEnvironmentVariableW(kPakBlobEnv, name, ARRAYSIZE(name));
+  DWORD len = GetEnvironmentVariableW(target.blob_env, name, ARRAYSIZE(name));
   if (len == 0 || len >= ARRAYSIZE(name)) {
     return false;
   }
@@ -244,6 +240,135 @@ bool PatchSettingsHtml(uint8_t* begin, uint32_t size, size_t& new_len) {
   return true;
 }
 
+void CompactJsForPakPatch(std::string& js) {
+  std::string out;
+  out.reserve(js.size());
+  size_t i = 0;
+  const size_t n = js.size();
+  bool in_license_block = false;
+  while (i < n) {
+    size_t eol = js.find('\n', i);
+    if (eol == std::string::npos) {
+      eol = n;
+    }
+    size_t s = i;
+    size_t e = eol;
+    while (s < e && (js[s] == ' ' || js[s] == '\t' || js[s] == '\r')) {
+      ++s;
+    }
+    while (e > s && (js[e - 1] == ' ' || js[e - 1] == '\t' || js[e - 1] == '\r')) {
+      --e;
+    }
+    const std::string_view line(js.data() + s, e - s);
+    if (in_license_block) {
+      if (line.find("*/") != std::string_view::npos) {
+        in_license_block = false;
+      }
+      i = (eol < n) ? (eol + 1) : n;
+      continue;
+    }
+    if (line.starts_with("/*") && line.find("Copyright") != std::string_view::npos) {
+      if (line.find("*/") == std::string_view::npos) {
+        in_license_block = true;
+      }
+      i = (eol < n) ? (eol + 1) : n;
+      continue;
+    }
+    const bool drop =
+        line.empty() || line.starts_with("// Copyright") ||
+        line.starts_with("// Use of this source") ||
+        line.starts_with("// found in the LICENSE") ||
+        line.starts_with("// clang-format") ||
+        line.starts_with("// eslint-disable");
+    if (!drop) {
+      if (!out.empty()) {
+        out.push_back('\n');
+      }
+      out.append(line);
+    }
+    i = (eol < n) ? (eol + 1) : n;
+  }
+  js = std::move(out);
+}
+
+// Injects a lightweight `#cp_sync=<base64url_json>` handler into
+// `chrome://bookmarks`'s JS bundle so Chrome++ popup edits (delete/edit/add/
+// drag-reorder) synchronize immediately into Chrome's live in-memory
+// BookmarkModel, built-in BookmarkBarView, and Google Account Sync.
+bool PatchBookmarksJs(uint8_t* begin, uint32_t size, size_t& new_len) {
+  const std::span<uint8_t> buf(begin, size);
+  constexpr char kNeedle1[] = "chrome.bookmarks.getTree";
+  if (SearchMemory(
+          buf, std::span<const uint8_t>(
+                   reinterpret_cast<const uint8_t*>(kNeedle1),
+                   sizeof(kNeedle1) - 1))
+          .empty()) {
+    return false;
+  }
+  constexpr char kNeedle2[] = "bookmarks-app";
+  constexpr char kNeedle3[] = "chrome.bookmarkManagerPrivate";
+  const bool has_app =
+      !SearchMemory(
+           buf, std::span<const uint8_t>(
+                    reinterpret_cast<const uint8_t*>(kNeedle2),
+                    sizeof(kNeedle2) - 1))
+           .empty();
+  const bool has_private =
+      !SearchMemory(
+           buf, std::span<const uint8_t>(
+                    reinterpret_cast<const uint8_t*>(kNeedle3),
+                    sizeof(kNeedle3) - 1))
+           .empty();
+  if (!has_app && !has_private) {
+    return false;
+  }
+
+  std::string js(reinterpret_cast<char*>(begin), size);
+  CompactJsForPakPatch(js);
+
+  // Executed only when opened with `#cp_sync=<base64url>` by Chrome++.
+  // Normal `chrome://bookmarks/` visits return immediately on line 1.
+  static constexpr std::string_view kSyncSnippet =
+      "\n;(async()=>{let h=location.hash;if(!h.startsWith(\"#cp_sync=\"))return;"
+      "document.documentElement.style.display=\"none\";"
+      "let a=\"\",ok=0,M={},C=[],B=chrome.bookmarks,"
+      "P=(f,...x)=>new Promise(r=>{try{f.call(B,...x,v=>{void chrome.runtime?.lastError;r(v)})}catch{r()}}),"
+      "fl=(n,o=[])=>{for(let e of n||[]){o.push(e);if(e.children)fl(e.children,o)}return o},"
+      "fr=(r,b,s)=>{let t=b?\"bookmarks-bar\":\"other\",x=r.filter(e=>e.folderType==t);"
+      "return x.length?x.find(e=>!!e.syncing==s)||x[0]:r.find(e=>e.id==(b?\"1\":\"2\"))||r[b?0:1]||r[0]},"
+      "fn=(A,i,t,u,F,s)=>{let m=M[i]||i,e=m&&A.find(x=>x.id==m);"
+      "if(e&&(F===void 0||!!e.children==!!F)&&(M[i]||(F?!t||e.title==t:(!u||e.url==u)&&(!t||e.title==t))))return e;"
+      "let c=A.filter(x=>x.parentId&&x.parentId!=\"0\"&&(F===true?x.children&&x.title==t:F===false?!x.children&&u&&x.url==u:u?!x.children&&x.url==u:t&&x.title==t));"
+      "return c.length?c.find(x=>x.title==t&&!!x.syncing==s)||c.find(x=>x.title==t)||c.find(x=>!!x.syncing==s)||c[0]:e&&(F===void 0||!!e.children==!!F)&&(!u||e.url==u)?e:null},"
+      "fd=(r,A,i,t,s)=>i==\"__bookmark_bar__\"?fr(r,1,s):i==\"__other__\"?fr(r,0,s):fn(A,i,t,\"\",true,s);"
+      "try{let s=h.slice(9).replace(/-/g,\"+\").replace(/_/g,\"/\"),"
+      "b=atob(s+\"=\".repeat((4-s.length%4)%4)),"
+      "p=JSON.parse(new TextDecoder().decode(Uint8Array.from(b,c=>c.charCodeAt(0))));"
+      "a=p.ack||\"\";"
+      "for(let o of p.ops||[]){let T=await P(B.getTree);if(!T?.[0])break;"
+      "let r=T[0].children||[],A=fl(r),w=o.ds==\"a\",q=o.ss==\"a\";"
+      "if(o.k==\"d\"){let n=fn(A,o.id,o.ot,o.ou,o.f,q);if(n){await P(n.children?B.removeTree:B.remove,n.id);ok++}}"
+      "else if(o.k==\"u\"){let n=fn(A,o.id,o.ot,o.ou,o.f,q);if(n){let c={title:o.t};if(o.hu&&!n.children)c.url=o.u;await P(B.update,n.id,c);ok++}}"
+      "else if(o.k==\"a\"||o.k==\"m\"){let d=fd(r,A,o.df,o.dt,w),n=o.k==\"m\"?fn(A,o.id,o.ot,o.ou,o.f,q):1;"
+      "if(n&&d&&n.id!=d.id){let K=d.children||[],g=(o.ai||o.at||o.au)&&fn(K,o.ai,o.at,o.au,void 0,w),"
+      "x=g&&g.id!=n.id?K.indexOf(g):-1,idx=x>=0?(o.ia?x+1:x):-1;"
+      "if(o.k==\"a\"){let q={parentId:d.id,title:o.t};if(!o.f)q.url=o.u;if(idx>=0&&idx<=K.length)q.index=idx;"
+      "let v=await P(B.create,q);if(v?.id){M[o.id]=v.id;C.push(o.id+\":\"+v.id);ok++}}"
+      "else{let q={parentId:d.id};if(idx>=0)q.index=idx;await P(B.move,n.id,q);ok++}}}}"
+      "}catch{}"
+      "if(/^http:\\/\\/127\\.0\\.0\\.1:\\d+\\/api\\/bm-ack\\?/.test(a))"
+      "location.replace(a+\"&ok=\"+ok+(C.length?\"&map=\"+encodeURIComponent(C.join(\",\")):\"\"));"
+      "else window.close()})();\n";
+
+  js.append(kSyncSnippet);
+  if (js.length() > size) {
+    return false;
+  }
+  memcpy(begin, js.c_str(), js.length());
+  new_len = js.length();
+  return true;
+}
+
 // A file the cache below holds results for. The identity changes whenever
 // Chrome replaces resources.pak, which a new version always does.
 struct PakFileIdentity {
@@ -273,11 +398,6 @@ std::optional<PakFileIdentity> GetFileIdentity(HANDLE file) {
 // Set where the pak's mapping is created, before `PatchResourcesPak` runs.
 std::optional<PakFileIdentity> resources_pak_identity;
 
-// The browser keeps its result on disk, so only the first start with a new
-// resources.pak or a new Chrome++ build pays for the scan and the recompression
-// (a few hundred milliseconds on the browser's main thread). The file is
-// followed by the patched entry. Renderers never read it; they still get the
-// browser's result through the read-only section.
 struct PakCacheHeader {
   uint32_t magic;
   uint64_t build_hash;
@@ -291,21 +411,37 @@ struct PakCacheHeader {
 };
 
 constexpr uint32_t kPakCacheMagic = 0x43505045;
-constexpr wchar_t kPakCacheName[] = L"Chrome++_PakCache.bin";
-// The patched bytes embed the build's version and architecture.
-constexpr char kPatchBuild[] = RELEASE_VER_STR BUILD_ARCH;
-// Bounds the read of a file whose size field is damaged.
 constexpr int64_t kMaxPakCacheSize = 64 * 1024 * 1024;
+
+constexpr PakPatchTarget kSettingsTarget{
+    .id_env = L"CHROME_PLUS_PAK_RES_ID",
+    .blob_env = L"CHROME_PLUS_PAK_BLOB",
+    .section_prefix = L"Local\\ChromePlusPakBlob_",
+    .cache_name = L"Chrome++_PakCache.bin",
+    .build_tag = RELEASE_VER_STR BUILD_ARCH,
+    .min_entry_size = 10 * 1024,
+    .patch_fn = PatchSettingsHtml,
+};
+
+constexpr PakPatchTarget kBookmarksTarget{
+    .id_env = L"CHROME_PLUS_PAK_BM_ID",
+    .blob_env = L"CHROME_PLUS_PAK_BM_BLOB",
+    .section_prefix = L"Local\\ChromePlusPakBmBlob_",
+    .cache_name = L"Chrome++_PakCache_Bm.bin",
+    .build_tag = RELEASE_VER_STR BUILD_ARCH "-bm-sync-v1",
+    .min_entry_size = 2 * 1024,
+    .patch_fn = PatchBookmarksJs,
+};
 
 uint64_t HashEntry(std::span<const uint8_t> entry) {
   return Fnv1aHash(std::as_bytes(entry));
 }
 
-// Asks chrome_elf for the user data directory, the answer Chrome itself uses
-// (`InitializeUserDataDir` in chrome/app/chrome_main_delegate.cc): the
-// `--user-data-dir` switch, overridden by the UserDataDir policy, or the
-// default. Whoever can write there can already change the profile, so the
-// cached entry handed to chrome://settings needs no further check.
+uint64_t HashBuildTag(const char* tag) {
+  return Fnv1aHash(
+      std::as_bytes(std::span<const char>(tag, std::strlen(tag))));
+}
+
 std::optional<std::wstring> GetPakCacheDir() {
   using GetUserDataDirectoryThunkFn =
       bool (*)(wchar_t*, size_t, wchar_t*, size_t, bool*);
@@ -328,8 +464,9 @@ std::optional<std::wstring> GetPakCacheDir() {
   return std::wstring(dir);
 }
 
-std::wstring GetPakCachePath(const std::wstring& dir) {
-  return dir + L"\\" + kPakCacheName;
+std::wstring GetPakCachePath(const std::wstring& dir,
+                             const wchar_t* cache_name) {
+  return dir + L"\\" + cache_name;
 }
 
 std::optional<std::vector<uint8_t>> ReadPakCache(const std::wstring& path) {
@@ -354,13 +491,9 @@ std::optional<std::vector<uint8_t>> ReadPakCache(const std::wstring& path) {
   return data;
 }
 
-// Applies the cached result for `identity` to `buffer`. Returns the resource
-// id it records, 0 when it records that the pak has no target, or nullopt
-// when there is no usable result. When `skip_bytes` is true (because the patch
-// embeds a per-session settings URL), `hint_id` still receives the cached
-// resource id so the caller can patch that single entry without a full scan.
 std::optional<uint16_t> ApplyCachedResult(uint8_t* buffer,
                                           const PakFileIdentity& identity,
+                                          const PakPatchTarget& target,
                                           bool skip_bytes,
                                           uint16_t* hint_id) {
   const std::optional<std::wstring> dir = GetPakCacheDir();
@@ -368,7 +501,7 @@ std::optional<uint16_t> ApplyCachedResult(uint8_t* buffer,
     return std::nullopt;
   }
   const std::optional<std::vector<uint8_t>> data =
-      ReadPakCache(GetPakCachePath(*dir));
+      ReadPakCache(GetPakCachePath(*dir, target.cache_name));
   if (!data || data->size() < sizeof(PakCacheHeader)) {
     return std::nullopt;
   }
@@ -387,8 +520,7 @@ std::optional<uint16_t> ApplyCachedResult(uint8_t* buffer,
   if (hint_id) {
     *hint_id = header.resource_id;
   }
-  if (skip_bytes ||
-      header.build_hash != Fnv1aHash(std::as_bytes(std::span(kPatchBuild)))) {
+  if (skip_bytes || header.build_hash != HashBuildTag(target.build_tag)) {
     return std::nullopt;
   }
   const std::optional<PakResourceSlot> slot =
@@ -403,7 +535,8 @@ std::optional<uint16_t> ApplyCachedResult(uint8_t* buffer,
 
 void SaveResultToCache(uint8_t* buffer,
                        uint16_t resource_id,
-                       const PakFileIdentity& identity) {
+                       const PakFileIdentity& identity,
+                       const PakPatchTarget& target) {
   const std::optional<std::wstring> dir = GetPakCacheDir();
   if (!dir) {
     return;
@@ -418,19 +551,15 @@ void SaveResultToCache(uint8_t* buffer,
     entry = std::span(buffer + slot->offset, slot->length);
   }
   PakCacheHeader header;
-  // Zeroes the padding too, so no stray stack bytes reach the file.
   memset(&header, 0, sizeof(header));
   header.magic = kPakCacheMagic;
-  header.build_hash = Fnv1aHash(std::as_bytes(std::span(kPatchBuild)));
+  header.build_hash = HashBuildTag(target.build_tag);
   header.pak = identity;
   header.resource_id = resource_id;
   header.length = static_cast<uint32_t>(entry.size());
   header.entry_hash = HashEntry(entry);
 
-  // Written under a temporary name and moved over the old file, so a reader
-  // never sees a partly written one. The name is per process because a second
-  // chrome.exe that hands its command line to a running browser also gets here.
-  const std::wstring path = GetPakCachePath(*dir);
+  const std::wstring path = GetPakCachePath(*dir, target.cache_name);
   const std::wstring temp_path =
       path + L"." + std::to_wstring(GetCurrentProcessId()) + L".tmp";
   HANDLE file = CreateFileW(temp_path.c_str(), GENERIC_WRITE, 0, nullptr,
@@ -453,25 +582,19 @@ void SaveResultToCache(uint8_t* buffer,
   }
 }
 
-// One flow per process kind: the browser applies its cached result or locates
-// and patches the entry itself, then publishes the id and the patched bytes
-// for its children, or that there is no target; a renderer takes the cheapest
-// tier available --
-// nothing to patch, published bytes (no decompression), targeted decompress
-// (one entry), full content scan. Runs
-// inside `MyMapViewOfFile` after both hooks have detached themselves, so the
-// section create/open/map calls in the publish and apply helpers reach the
-// real APIs, not our hooks.
-void PatchResourcesPak(uint8_t* buffer) {
+uint16_t PatchOneTarget(uint8_t* buffer,
+                        const PakPatchTarget& target,
+                        size_t slot_index) {
   const bool is_browser = IsBrowserProcess();
-  if (!is_browser && (IsPakTargetMissing() || ApplyPatchedEntry(buffer))) {
-    return;
+  if (!is_browser &&
+      (IsPakTargetMissing(target.id_env) || ApplyPatchedEntry(buffer, target))) {
+    return 1;
   }
 
   std::optional<uint16_t> cached_id;
   uint16_t cached_hint_id = 0;
   if (is_browser && resources_pak_identity) {
-    cached_id = ApplyCachedResult(buffer, *resources_pak_identity,
+    cached_id = ApplyCachedResult(buffer, *resources_pak_identity, target,
                                   /*skip_bytes=*/false, &cached_hint_id);
   }
   uint16_t matched_id = 0;
@@ -479,28 +602,37 @@ void PatchResourcesPak(uint8_t* buffer) {
     matched_id = *cached_id;
   } else {
     const uint16_t target_id =
-        cached_hint_id != 0 ? cached_hint_id : GetPakTargetId();
-    matched_id = PatchPakResource(buffer, PatchSettingsHtml, target_id);
+        cached_hint_id != 0 ? cached_hint_id : GetPakTargetId(target.id_env);
+    matched_id = PatchPakResource(buffer, target.patch_fn, target_id,
+                                  target.min_entry_size);
     if (matched_id == 0 && target_id != 0) {
-      // The inherited id missed, so the pak was replaced (browser updated
-      // between sessions); redo the full content scan.
-      matched_id = PatchPakResource(buffer, PatchSettingsHtml, 0);
+      matched_id =
+          PatchPakResource(buffer, target.patch_fn, 0, target.min_entry_size);
     }
     if (is_browser && resources_pak_identity) {
-      SaveResultToCache(buffer, matched_id, *resources_pak_identity);
+      SaveResultToCache(buffer, matched_id, *resources_pak_identity, target);
     }
   }
 
   if (!is_browser) {
-    return;
+    return matched_id;
   }
   if (matched_id == 0) {
-    DebugLog(L"PakPatch: no target in resources.pak");
-    SetEnvironmentVariableW(kPakTargetIdEnv, kPakTargetMissing);
-    return;
+    DebugLog(L"PakPatch: no target in resources.pak for {}", target.id_env);
+    SetEnvironmentVariableW(target.id_env, kPakTargetMissing);
+    return 0;
   }
-  SetEnvironmentVariableW(kPakTargetIdEnv, std::to_wstring(matched_id).c_str());
-  PublishPatchedEntry(buffer, matched_id);
+  SetEnvironmentVariableW(target.id_env, std::to_wstring(matched_id).c_str());
+  PublishPatchedEntry(buffer, matched_id, target, slot_index);
+  return matched_id;
+}
+
+void PatchResourcesPak(uint8_t* buffer) {
+  PatchOneTarget(buffer, kSettingsTarget, 0);
+  const uint16_t bm_id = PatchOneTarget(buffer, kBookmarksTarget, 1);
+  if (IsBrowserProcess() && bm_id != 0) {
+    g_bookmarks_pak_patched.store(true, std::memory_order_relaxed);
+  }
 }
 
 HANDLE WINAPI MyMapViewOfFile(_In_ HANDLE hFileMappingObject,
@@ -609,4 +741,8 @@ void PakPatch() {
   if (status != NO_ERROR) {
     DebugLog(L"Hook RawCreateFileMapping failed {}", status);
   }
+}
+
+bool IsBookmarksPakPatched() {
+  return g_bookmarks_pak_patched.load(std::memory_order_relaxed);
 }

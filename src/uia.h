@@ -34,6 +34,8 @@ bool SelectTab(const Microsoft::WRL::ComPtr<IUIAutomationElement>& tab);
 struct BookmarkAnchorRect {
   RECT rect{};
   bool found = false;
+  int gap_left = 0;
+  bool has_gap_left = false;
 };
 // anchor_mode: 0=left of address bar, 1=leftmost of toolbar, 2=top-left of tab strip.
 [[nodiscard]] std::optional<BookmarkAnchorRect> FindBookmarkButtonAnchor(

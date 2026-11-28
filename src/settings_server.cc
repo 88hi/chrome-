@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <charconv>
 #include <cstdint>
@@ -16,9 +17,11 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "bookmark_button.h"
+#include "bookmark_model.h"
 #include "config.h"
 #include "utils.h"
 #include "version.h"
@@ -29,6 +32,7 @@ constexpr uint16_t kSettingsPort = 19876;
 constexpr std::string_view kExpectedHost = "127.0.0.1:19876";
 
 std::string g_session_token;
+std::atomic<bool> g_server_ready{false};
 
 std::string WideToUtf8(std::wstring_view wide) {
   if (wide.empty()) {
@@ -1012,11 +1016,89 @@ void HandleClient(SOCKET client) {
   const size_t q = target.find('?');
   const std::string_view path =
       q == std::string_view::npos ? target : target.substr(0, q);
+  const std::string_view query =
+      q == std::string_view::npos ? std::string_view{} : target.substr(q + 1);
+
+  auto decode_uri = [](std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    auto hex = [](char c) -> int {
+      if (c >= '0' && c <= '9') return c - '0';
+      if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+      if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+      return -1;
+    };
+    for (size_t i = 0; i < s.size(); ++i) {
+      if (s[i] == '%' && i + 2 < s.size()) {
+        const int hi = hex(s[i + 1]);
+        const int lo = hex(s[i + 2]);
+        if (hi >= 0 && lo >= 0) {
+          out.push_back(static_cast<char>((hi << 4) | lo));
+          i += 2;
+          continue;
+        }
+      }
+      out.push_back(s[i] == '+' ? ' ' : s[i]);
+    }
+    return out;
+  };
+
+  auto get_query_param = [&](std::string_view key) -> std::string {
+    size_t pos = 0;
+    while (pos < query.size()) {
+      size_t amp = query.find('&', pos);
+      if (amp == std::string_view::npos) {
+        amp = query.size();
+      }
+      const std::string_view pair = query.substr(pos, amp - pos);
+      const size_t eq = pair.find('=');
+      if (eq != std::string_view::npos && pair.substr(0, eq) == key) {
+        return decode_uri(pair.substr(eq + 1));
+      }
+      pos = amp + 1;
+    }
+    return {};
+  };
 
   if (method == "GET" && path == "/") {
     std::string html = GetSettingsHtml();
     ReplaceStringInPlace(html, "__CHROME_PLUS_TOKEN__", g_session_token);
     SendHttpResponse(client, "200 OK", "text/html; charset=utf-8", html);
+  } else if (method == "GET" && path == "/api/bm-ack") {
+    if (get_query_param("token") != g_session_token) {
+      SendHttpResponse(client, "403 Forbidden", "text/plain; charset=utf-8",
+                       "Forbidden");
+    } else {
+      const std::string seq_str = get_query_param("seq");
+      uint64_t seq = 0;
+      const auto [ptr, ec] = std::from_chars(
+          seq_str.data(), seq_str.data() + seq_str.size(), seq);
+      if (ec == std::errc{} && ptr == seq_str.data() + seq_str.size() &&
+          seq > 0) {
+        std::vector<std::pair<std::string, std::string>> id_map;
+        const std::string map_str = get_query_param("map");
+        size_t pos = 0;
+        while (pos < map_str.size()) {
+          size_t comma = map_str.find(',', pos);
+          if (comma == std::string::npos) {
+            comma = map_str.size();
+          }
+          const std::string_view entry(map_str.data() + pos, comma - pos);
+          const size_t colon = entry.find(':');
+          if (colon != std::string_view::npos && colon > 0 &&
+              colon + 1 < entry.size()) {
+            id_map.emplace_back(std::string(entry.substr(0, colon)),
+                                std::string(entry.substr(colon + 1)));
+          }
+          pos = comma + 1;
+        }
+        BookmarkModel::Instance().MarkOpsSynced(seq, id_map);
+      }
+      SendHttpResponse(
+          client, "200 OK", "text/html; charset=utf-8",
+          "<!doctype html><html><head><meta charset=\"utf-8\"></head>"
+          "<body><script>window.close();</script></body></html>");
+    }
   } else if (method == "GET" && path == "/api/config") {
     if (GetHeaderValue(headers, "X-Chrome-Plus-Token") != g_session_token) {
       SendHttpResponse(client, "403 Forbidden", "application/json",
@@ -1049,6 +1131,14 @@ void HandleClient(SOCKET client) {
 }
 
 }  // namespace
+
+std::string GetSettingsSessionToken() {
+  return g_session_token;
+}
+
+bool IsSettingsServerReady() {
+  return g_server_ready.load(std::memory_order_relaxed);
+}
 
 void StartSettingsServer() {
   g_session_token = GenerateSessionToken();
@@ -1099,6 +1189,7 @@ void StartSettingsServer() {
       return;
     }
 
+    g_server_ready.store(true, std::memory_order_relaxed);
     DebugLog(L"SettingsServer: listening on http://127.0.0.1:{}", kSettingsPort);
 
     while (true) {
@@ -1112,6 +1203,7 @@ void StartSettingsServer() {
       }
       HandleClient(client);
     }
+    g_server_ready.store(false, std::memory_order_relaxed);
     ::closesocket(listen_sock);
   }).detach();
 }

@@ -25,6 +25,8 @@
 #include "bookmark_model.h"
 #include "config.h"
 #include "inputhook.h"
+#include "pakpatch.h"
+#include "settings_server.h"
 #include "tabbookmark.h"
 #include "utils.h"
 
@@ -38,6 +40,7 @@ constexpr wchar_t kEditDialogClassName[] = L"ChromePlusBookmarkEditDialog";
 constexpr UINT kMsgFaviconReady = WM_APP + 0x41;
 constexpr UINT_PTR kHoverTimerId = 0x424D4856;      // 'BMHV'
 constexpr UINT_PTR kBatchOpenTimerId = 0x424D424F;  // 'BMBO'
+constexpr UINT_PTR kLiveSyncTimerId = 0x424D5359;   // 'BMSY'
 constexpr UINT kHoverDelayNormalMs = 110;
 constexpr UINT kHoverDelaySafeTriangleMs = 280;
 constexpr UINT kDefaultDpi = 96;
@@ -311,6 +314,76 @@ struct PopupManagerState {
 PopupManagerState& GetManager() {
   static PopupManagerState mgr;
   return mgr;
+}
+
+struct LiveSyncState {
+  uint64_t last_dispatched_seq = 0;
+  ULONGLONG last_dispatch_tick = 0;
+  int retry_count = 0;
+};
+
+LiveSyncState& GetLiveSyncState() {
+  static LiveSyncState s;
+  return s;
+}
+
+void CALLBACK LiveSyncTimerProc(HWND hwnd, UINT, UINT_PTR event_id, DWORD) {
+  ::KillTimer(hwnd, event_id);
+  auto& st = GetLiveSyncState();
+  if (!hwnd || !::IsWindow(hwnd) || !IsBookmarksPakPatched()) {
+    return;
+  }
+
+  HWND fg = ::GetForegroundWindow();
+  if (fg != hwnd) {
+    if (IsBookmarkPopupWindow(fg)) {
+      ::SetForegroundWindow(hwnd);
+      fg = ::GetForegroundWindow();
+    }
+    if (fg != hwnd) {
+      if (st.retry_count < 8) {
+        ++st.retry_count;
+        ::SetTimer(hwnd, kLiveSyncTimerId, 150, LiveSyncTimerProc);
+      }
+      return;
+    }
+  }
+
+  uint64_t max_seq = 0;
+  const std::string token =
+      IsSettingsServerReady() ? GetSettingsSessionToken() : std::string{};
+  const auto sync_url = BookmarkModel::Instance().BuildLiveSyncUrl(
+      token.empty() ? std::string_view{} : GetSettingsServerUrl(), token,
+      &max_seq);
+  if (!sync_url || max_seq == 0) {
+    st.retry_count = 0;
+    return;
+  }
+
+  const ULONGLONG now = ::GetTickCount64();
+  if (max_seq <= st.last_dispatched_seq && now - st.last_dispatch_tick < 2000) {
+    return;
+  }
+  if (st.last_dispatch_tick != 0 && now - st.last_dispatch_tick < 350 &&
+      st.retry_count < 6) {
+    ++st.retry_count;
+    ::SetTimer(hwnd, kLiveSyncTimerId, 350, LiveSyncTimerProc);
+    return;
+  }
+
+  st.last_dispatched_seq = max_seq;
+  st.last_dispatch_tick = now;
+  st.retry_count = 0;
+  OpenInNewTab(hwnd, *sync_url, /*background=*/true);
+}
+
+void ScheduleLiveChromeSync(HWND chrome_root, UINT delay_ms = 120) {
+  if (!chrome_root || !::IsWindow(chrome_root) || !IsBookmarksPakPatched()) {
+    return;
+  }
+  auto& st = GetLiveSyncState();
+  st.retry_count = 0;
+  ::SetTimer(chrome_root, kLiveSyncTimerId, delay_ms, LiveSyncTimerProc);
 }
 
 void ClosePopupsFromLevel(int from_level);
@@ -1340,6 +1413,7 @@ void CommitItemDrag(POINT release_screen) {
           dst_folder_id, dst_folder_guid, anchor_id, anchor_guid, insert_after,
           config.IsBookmarksShowOther())) {
     ReloadPopupStackItems();
+    ScheduleLiveChromeSync(mgr.chrome_root, 180);
   }
 }
 
@@ -1676,6 +1750,8 @@ void ShowContextMenuForPopup(PopupWindow* win,
       (has_item && !target_node.is_virtual_root) ? target_node.guid : L"";
   HWND dlg_owner = mgr.chrome_root ? mgr.chrome_root : win->hwnd;
 
+  bool mutated = false;
+
   switch (cmd) {
     case kCmdOpenFg:
       mgr.modal_ui_active = false;
@@ -1717,6 +1793,7 @@ void ShowContextMenuForPopup(PopupWindow* win,
                 is_url ? std::optional<std::wstring>(url) : std::nullopt,
                 config.IsBookmarksShowOther())) {
           ReloadPopupStackItems();
+          mutated = true;
         }
       }
       break;
@@ -1736,6 +1813,7 @@ void ShowContextMenuForPopup(PopupWindow* win,
               target_node.source, target_node.id, target_node.guid,
               config.IsBookmarksShowOther())) {
         ReloadPopupStackItems();
+        mutated = true;
       }
       break;
     }
@@ -1750,6 +1828,7 @@ void ShowContextMenuForPopup(PopupWindow* win,
                 /*is_folder=*/false, title, url,
                 config.IsBookmarksShowOther())) {
           ReloadPopupStackItems();
+          mutated = true;
         }
       }
       break;
@@ -1766,6 +1845,7 @@ void ShowContextMenuForPopup(PopupWindow* win,
                 /*is_folder=*/true, title, L"",
                 config.IsBookmarksShowOther())) {
           ReloadPopupStackItems();
+          mutated = true;
         }
       }
       break;
@@ -1785,6 +1865,7 @@ void ShowContextMenuForPopup(PopupWindow* win,
                 /*insert_after=*/true, /*is_folder=*/false, title, url,
                 config.IsBookmarksShowOther())) {
           ReloadPopupStackItems();
+          mutated = true;
         }
       }
       break;
@@ -1804,6 +1885,7 @@ void ShowContextMenuForPopup(PopupWindow* win,
                 /*insert_after=*/true, /*is_folder=*/true, title, L"",
                 config.IsBookmarksShowOther())) {
           ReloadPopupStackItems();
+          mutated = true;
         }
       }
       break;
@@ -1811,6 +1893,9 @@ void ShowContextMenuForPopup(PopupWindow* win,
   }
 
   mgr.modal_ui_active = false;
+  if (mutated && mgr.chrome_root) {
+    ScheduleLiveChromeSync(mgr.chrome_root, 120);
+  }
 }
 
 void HandleHoverTimer(PopupWindow* win) {
@@ -2471,6 +2556,7 @@ void ToggleBookmarkPopup(HWND chrome_root,
     mgr.stack.push_back(std::move(root_popup));
     BookmarkModel::Instance().RequestFaviconsAsync(notify_hwnd,
                                                    kMsgFaviconReady);
+    ScheduleLiveChromeSync(chrome_root, 350);
   }
 }
 

@@ -94,9 +94,6 @@ bool CheckHeader(uint8_t* buffer, PakEntry*& pak_entry, PakEntry*& end_entry) {
 
 using PatchCallback = std::function<bool(uint8_t*, uint32_t, size_t&)>;
 
-// The patch target is far larger, so smaller entries are skipped without
-// being decompressed.
-constexpr size_t kMinCandidateSize = 10 * 1024;
 // Bounds the allocation for a size read from a damaged entry. Chrome 160's
 // largest resource decompresses to under 3 MiB.
 constexpr uint64_t kMaxContentSize = 32 * 1024 * 1024;
@@ -155,8 +152,9 @@ bool PatchGzipEntry(std::span<uint8_t> entry, const PatchCallback& f) {
     *extra_len_dest = extra_length;
     std::ranges::fill(entry.subspan(12, extra_length), 0);
     std::ranges::copy(src_span.subspan(10), entry.begin() + 12 + extra_length);
+    return true;
   }
-  return true;
+  return false;
 }
 
 // Encodes `content` over `entry` as one frame followed by a skippable frame
@@ -202,8 +200,8 @@ bool WriteZstdEntry(std::span<const uint8_t> content,
   return true;
 }
 
-// Returns whether `f` claimed the entry. See `WriteZstdEntry` for when the
-// entry is rewritten.
+// Returns whether `f` claimed the entry and the patched data fit back into the
+// slot.
 bool PatchZstdEntry(std::span<uint8_t> entry, const PatchCallback& f) {
   // grit stores the content size in every frame, and Chrome CHECKs that it is
   // there (`DecompressIfNeeded` in ui/base/resource/resource_bundle.cc).
@@ -230,6 +228,7 @@ bool PatchZstdEntry(std::span<uint8_t> entry, const PatchCallback& f) {
                       entry)) {
     DebugLog(L"PakPatch: patched entry doesn't fit its {}-byte slot",
              entry.size());
+    return false;
   }
   return true;
 }
@@ -238,7 +237,8 @@ bool PatchZstdEntry(std::span<uint8_t> entry, const PatchCallback& f) {
 
 uint16_t PatchPakResource(uint8_t* buffer,
                           std::function<bool(uint8_t*, uint32_t, size_t&)>&& f,
-                          uint16_t target_resource_id) {
+                          uint16_t target_resource_id,
+                          size_t min_entry_size) {
   PakEntry* pak_entry = nullptr;
   PakEntry* end_entry = nullptr;
 
@@ -252,7 +252,7 @@ uint16_t PatchPakResource(uint8_t* buffer,
                              next_entry->file_offset - pak_entry->file_offset);
     const bool is_candidate =
         target_resource_id == 0 || pak_entry->resource_id == target_resource_id;
-    if (is_candidate && entry.size() >= kMinCandidateSize) {
+    if (is_candidate && entry.size() >= min_entry_size) {
       bool claimed = false;
       if (StartsWith(entry, kGzipMagic)) {
         claimed = PatchGzipEntry(entry, f);

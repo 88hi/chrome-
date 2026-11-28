@@ -43,6 +43,9 @@ void ChromePlus() {
   // Portable hijack patch.
   MakeGreen();
 
+  // Flush any unsynced Chrome++ bookmark edits before Chrome loads Bookmarks.
+  BookmarkModel::Instance().FlushPendingOpsToChromeFiles(/*is_pre_launch=*/true);
+
   // Ignore enterprise policies.
   IgnorePolicies();
 

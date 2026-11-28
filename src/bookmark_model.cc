@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "config.h"
+#include "pakpatch.h"
 #include "portable.h"
 #include "sqlite3.h"
 #include "utils.h"
@@ -807,6 +808,7 @@ std::shared_ptr<FaviconBitmap> DecodePngToPbgra(
 
 struct BookmarkStore {
   std::mutex mutex;
+  std::mutex journal_mutex;
   std::wstring profile_dir;
   std::wstring last_diag = L"尚未加载";
   CombinedBookmarkStamp bookmarks_stamp;
@@ -1388,7 +1390,8 @@ std::string GenerateUuidV4() {
 }
 
 // Durable edit journal stored independently of Chrome's Bookmarks file so
-// Chrome's in-memory BookmarkStorage / Sync can never revert user edits.
+// Chrome's in-memory BookmarkStorage / Sync can never revert user edits, and
+// also used as the pending queue for real-time `chrome.bookmarks` live sync.
 struct BookmarkOp {
   enum class Kind {
     kMove,
@@ -1397,19 +1400,72 @@ struct BookmarkOp {
     kDelete,
   };
   Kind kind = Kind::kMove;
+  uint64_t seq = 0;
+  bool synced = false;
+  uint64_t synced_local_ts = 0;
+  uint64_t synced_account_ts = 0;
+  BookmarkSource src_source = BookmarkSource::kLocal;
   BookmarkSource dst_source = BookmarkSource::kLocal;
   std::string id;
   std::string guid;
+  std::string orig_title;
+  std::string orig_url;
   std::string dst_folder_id;
   std::string dst_folder_guid;
+  std::string dst_folder_title;
   std::string anchor_id;
   std::string anchor_guid;
+  std::string anchor_title;
+  std::string anchor_url;
   bool insert_after = true;
   bool is_folder = false;
   bool has_url = false;
   std::string title;
   std::string url;
 };
+
+std::string Base64UrlEncode(std::string_view input) {
+  constexpr char kTable[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  std::string out;
+  out.reserve(((input.size() + 2) / 3) * 4);
+  size_t i = 0;
+  while (i + 3 <= input.size()) {
+    const uint32_t v =
+        (static_cast<uint32_t>(static_cast<uint8_t>(input[i])) << 16) |
+        (static_cast<uint32_t>(static_cast<uint8_t>(input[i + 1])) << 8) |
+        static_cast<uint32_t>(static_cast<uint8_t>(input[i + 2]));
+    out.push_back(kTable[(v >> 18) & 0x3F]);
+    out.push_back(kTable[(v >> 12) & 0x3F]);
+    out.push_back(kTable[(v >> 6) & 0x3F]);
+    out.push_back(kTable[v & 0x3F]);
+    i += 3;
+  }
+  const size_t rem = input.size() - i;
+  if (rem == 1) {
+    const uint32_t v =
+        static_cast<uint32_t>(static_cast<uint8_t>(input[i])) << 16;
+    out.push_back(kTable[(v >> 18) & 0x3F]);
+    out.push_back(kTable[(v >> 12) & 0x3F]);
+  } else if (rem == 2) {
+    const uint32_t v =
+        (static_cast<uint32_t>(static_cast<uint8_t>(input[i])) << 16) |
+        (static_cast<uint32_t>(static_cast<uint8_t>(input[i + 1])) << 8);
+    out.push_back(kTable[(v >> 18) & 0x3F]);
+    out.push_back(kTable[(v >> 12) & 0x3F]);
+    out.push_back(kTable[(v >> 6) & 0x3F]);
+  }
+  return out;
+}
+
+uint64_t ParseUint64String(std::string_view s) {
+  uint64_t v = 0;
+  if (s.empty()) {
+    return 0;
+  }
+  const auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+  return (ec == std::errc{} && ptr == s.data() + s.size()) ? v : 0;
+}
 
 std::wstring GetJournalPath(const std::wstring& profile_dir) {
   if (!profile_dir.empty()) {
@@ -1425,6 +1481,23 @@ bool MatchesNodeIdOrGuid(const BookmarkNode& node,
     return node.guid == target_guid;
   }
   return !target_id.empty() && node.id == target_id;
+}
+
+const BookmarkNode* FindNodeConst(const std::vector<BookmarkNode>& list,
+                                  std::wstring_view target_id,
+                                  std::wstring_view target_guid) {
+  for (const auto& n : list) {
+    if (MatchesNodeIdOrGuid(n, target_id, target_guid)) {
+      return &n;
+    }
+    if (n.is_folder) {
+      if (const BookmarkNode* hit =
+              FindNodeConst(n.children, target_id, target_guid)) {
+        return hit;
+      }
+    }
+  }
+  return nullptr;
 }
 
 bool MatchesAstIdOrGuid(const JsonValue& node,
@@ -1451,6 +1524,24 @@ bool SameOpTarget(const BookmarkOp& a,
   return !id.empty() && a.id == id;
 }
 
+bool IsSyncedOpFlushedByChrome(const BookmarkOp& op,
+                               const CombinedBookmarkStamp& stamp) {
+  if (!op.synced) {
+    return false;
+  }
+  const uint64_t cur_local = stamp.local_stamp ? stamp.local_stamp->write_time : 0;
+  const uint64_t cur_account =
+      stamp.account_stamp ? stamp.account_stamp->write_time : 0;
+  const bool account_changed =
+      cur_account != 0 && cur_account > op.synced_account_ts;
+  const bool local_changed = cur_local != 0 && cur_local > op.synced_local_ts;
+  if (op.src_source == BookmarkSource::kAccount ||
+      op.dst_source == BookmarkSource::kAccount) {
+    return cur_account != 0 ? account_changed : local_changed;
+  }
+  return cur_local != 0 ? local_changed : account_changed;
+}
+
 std::vector<BookmarkOp> LoadJournalFromDisk(const std::wstring& profile_dir) {
   std::vector<BookmarkOp> ops;
   std::optional<std::string> text =
@@ -1469,6 +1560,7 @@ std::vector<BookmarkOp> LoadJournalFromDisk(const std::wstring& profile_dir) {
     return ops;
   }
 
+  uint64_t fallback_seq = 0;
   for (const auto& item : root.arr_val) {
     if (item.type != JsonValue::Type::kObject) {
       continue;
@@ -1486,15 +1578,36 @@ std::vector<BookmarkOp> LoadJournalFromDisk(const std::wstring& profile_dir) {
     } else {
       continue;
     }
+    op.seq = ParseUint64String(item.GetString("seq"));
+    if (op.seq == 0) {
+      op.seq = ++fallback_seq;
+    } else if (op.seq > fallback_seq) {
+      fallback_seq = op.seq;
+    }
+    if (const JsonValue* v = item.Find("synced");
+        v && v->type == JsonValue::Type::kBool) {
+      op.synced = v->bool_val;
+    }
+    op.synced_local_ts = ParseUint64String(item.GetString("synced_local_ts"));
+    op.synced_account_ts =
+        ParseUint64String(item.GetString("synced_account_ts"));
+    op.src_source = item.GetString("src_source") == "account"
+                        ? BookmarkSource::kAccount
+                        : BookmarkSource::kLocal;
     op.dst_source = item.GetString("dst_source") == "account"
                         ? BookmarkSource::kAccount
                         : BookmarkSource::kLocal;
     op.id = item.GetString("id");
     op.guid = item.GetString("guid");
+    op.orig_title = item.GetString("orig_title");
+    op.orig_url = item.GetString("orig_url");
     op.dst_folder_id = item.GetString("dst_folder_id");
     op.dst_folder_guid = item.GetString("dst_folder_guid");
+    op.dst_folder_title = item.GetString("dst_folder_title");
     op.anchor_id = item.GetString("anchor_id");
     op.anchor_guid = item.GetString("anchor_guid");
+    op.anchor_title = item.GetString("anchor_title");
+    op.anchor_url = item.GetString("anchor_url");
     if (const JsonValue* v = item.Find("insert_after");
         v && v->type == JsonValue::Type::kBool) {
       op.insert_after = v->bool_val;
@@ -1544,26 +1657,49 @@ bool SaveJournalToDisk(const std::wstring& profile_dir,
         obj.SetString("op", "delete");
         break;
     }
+    if (op.seq > 0) {
+      obj.SetString("seq", std::to_string(op.seq));
+    }
+    if (op.synced) {
+      obj.obj_val.emplace_back("synced", make_bool(true));
+      if (op.synced_local_ts > 0) {
+        obj.SetString("synced_local_ts", std::to_string(op.synced_local_ts));
+      }
+      if (op.synced_account_ts > 0) {
+        obj.SetString("synced_account_ts",
+                      std::to_string(op.synced_account_ts));
+      }
+    }
+    if (op.src_source == BookmarkSource::kAccount) {
+      obj.SetString("src_source", "account");
+    }
     if (op.dst_source == BookmarkSource::kAccount) {
       obj.SetString("dst_source", "account");
     }
     if (!op.id.empty()) obj.SetString("id", op.id);
     if (!op.guid.empty()) obj.SetString("guid", op.guid);
+    if (!op.orig_title.empty()) obj.SetString("orig_title", op.orig_title);
+    if (!op.orig_url.empty()) obj.SetString("orig_url", op.orig_url);
     if (!op.dst_folder_id.empty()) {
       obj.SetString("dst_folder_id", op.dst_folder_id);
     }
     if (!op.dst_folder_guid.empty()) {
       obj.SetString("dst_folder_guid", op.dst_folder_guid);
     }
+    if (!op.dst_folder_title.empty()) {
+      obj.SetString("dst_folder_title", op.dst_folder_title);
+    }
     if (!op.anchor_id.empty()) obj.SetString("anchor_id", op.anchor_id);
     if (!op.anchor_guid.empty()) obj.SetString("anchor_guid", op.anchor_guid);
+    if (!op.anchor_title.empty()) {
+      obj.SetString("anchor_title", op.anchor_title);
+    }
+    if (!op.anchor_url.empty()) obj.SetString("anchor_url", op.anchor_url);
     if (op.kind == BookmarkOp::Kind::kMove ||
         op.kind == BookmarkOp::Kind::kAdd) {
       obj.obj_val.emplace_back("insert_after", make_bool(op.insert_after));
     }
-    if (op.kind == BookmarkOp::Kind::kAdd) {
-      obj.obj_val.emplace_back("is_folder", make_bool(op.is_folder));
-    }
+    obj.obj_val.emplace_back("is_folder", make_bool(op.is_folder));
     if (op.kind == BookmarkOp::Kind::kUpdate) {
       obj.obj_val.emplace_back("has_url", make_bool(op.has_url));
     }
@@ -1588,16 +1724,31 @@ bool SaveJournalToDisk(const std::wstring& profile_dir,
   return WriteFileAtomicUtf8(GetAppDir() + L"\\" + kOpsFileName, out);
 }
 
+uint64_t NextJournalSeq(const std::vector<BookmarkOp>& ops) {
+  uint64_t max_seq = 0;
+  for (const auto& op : ops) {
+    if (op.seq > max_seq) {
+      max_seq = op.seq;
+    }
+  }
+  return max_seq + 1;
+}
+
 void AppendAndCompactOp(std::vector<BookmarkOp>& ops, BookmarkOp op) {
+  op.seq = NextJournalSeq(ops);
+  op.synced = false;
+
   if (op.kind == BookmarkOp::Kind::kUpdate) {
-    // Update an earlier Chrome++ Add op or Update op in-place if present.
+    // Only coalesce into an UNSYNCED earlier Add/Update so already-synced ops
+    // don't swallow new edits before live sync sees them.
     for (auto it = ops.rbegin(); it != ops.rend(); ++it) {
-      if (SameOpTarget(*it, op.id, op.guid)) {
+      if (!it->synced && SameOpTarget(*it, op.id, op.guid)) {
         if (it->kind == BookmarkOp::Kind::kAdd) {
           it->title = op.title;
           if (op.has_url) {
             it->url = op.url;
           }
+          it->seq = op.seq;
           return;
         }
         if (it->kind == BookmarkOp::Kind::kUpdate) {
@@ -1606,6 +1757,7 @@ void AppendAndCompactOp(std::vector<BookmarkOp>& ops, BookmarkOp op) {
             it->has_url = true;
             it->url = op.url;
           }
+          it->seq = op.seq;
           return;
         }
       }
@@ -1615,12 +1767,21 @@ void AppendAndCompactOp(std::vector<BookmarkOp>& ops, BookmarkOp op) {
   }
 
   if (op.kind == BookmarkOp::Kind::kDelete) {
-    // Drop earlier ops targeting this node, then always keep kDelete so even a
-    // previously-flushed local addition is removed from Chrome's disk file too.
+    bool was_unsynced_add = false;
+    for (const auto& existing : ops) {
+      if (!existing.synced && existing.kind == BookmarkOp::Kind::kAdd &&
+          SameOpTarget(existing, op.id, op.guid)) {
+        was_unsynced_add = true;
+        break;
+      }
+    }
+    // Remove earlier unsynced ops on the same target.
     std::erase_if(ops, [&](const BookmarkOp& existing) {
-      return SameOpTarget(existing, op.id, op.guid);
+      return !existing.synced && SameOpTarget(existing, op.id, op.guid);
     });
-    ops.push_back(std::move(op));
+    if (!was_unsynced_add) {
+      ops.push_back(std::move(op));
+    }
     return;
   }
 
@@ -2227,9 +2388,22 @@ bool BookmarkModel::EnsureLoaded(bool show_other_bookmarks, bool force) {
     return false;
   }
 
-  // Always replay Chrome++'s durable edit journal on top of Chrome's files so
-  // Chrome's in-memory BookmarkStorage / Sync never reverts user edits.
-  const std::vector<BookmarkOp> journal_ops = LoadJournalFromDisk(*profile_dir);
+  // Replay Chrome++'s durable edit journal on top of Chrome's files, pruning
+  // any live-synced ops once Chrome's BookmarkStorage has flushed them to disk.
+  CombinedBookmarkStamp effective_stamp = stamp;
+  std::vector<BookmarkOp> journal_ops;
+  {
+    std::lock_guard jlock(store.journal_mutex);
+    journal_ops = LoadJournalFromDisk(*profile_dir);
+    const size_t before_count = journal_ops.size();
+    std::erase_if(journal_ops, [&](const BookmarkOp& op) {
+      return IsSyncedOpFlushedByChrome(op, stamp);
+    });
+    if (journal_ops.size() != before_count) {
+      SaveJournalToDisk(*profile_dir, journal_ops);
+      effective_stamp = GetProfileBookmarkStamp(*profile_dir);
+    }
+  }
   if (!journal_ops.empty()) {
     ApplyOpsToInMemoryTree(*items, merged_other, default_source, journal_ops);
   }
@@ -2252,7 +2426,7 @@ bool BookmarkModel::EnsureLoaded(bool show_other_bookmarks, bool force) {
 
   std::lock_guard lock(store.mutex);
   store.profile_dir = *profile_dir;
-  store.bookmarks_stamp = stamp;
+  store.bookmarks_stamp = effective_stamp;
   store.last_show_other = show_other_bookmarks;
   store.last_diag = items->empty()
                         ? (L"书签栏为空: " + *profile_dir)
@@ -2261,10 +2435,10 @@ bool BookmarkModel::EnsureLoaded(bool show_other_bookmarks, bool force) {
   return true;
 }
 
-bool BookmarkModel::MoveBookmark(BookmarkSource /*src_source*/,
+bool BookmarkModel::MoveBookmark(BookmarkSource src_source,
                                  const std::wstring& src_id,
                                  const std::wstring& src_guid,
-                                 BookmarkSource /*dst_source*/,
+                                 BookmarkSource dst_source,
                                  const std::wstring& dst_folder_id,
                                  const std::wstring& dst_folder_guid,
                                  const std::wstring& anchor_id,
@@ -2277,10 +2451,12 @@ bool BookmarkModel::MoveBookmark(BookmarkSource /*src_source*/,
   }
 
   std::wstring profile_dir;
+  std::shared_ptr<const std::vector<BookmarkNode>> snapshot;
   {
     auto& store = GetStore();
     std::lock_guard lock(store.mutex);
     profile_dir = store.profile_dir;
+    snapshot = store.root_items;
   }
   if (profile_dir.empty()) {
     return false;
@@ -2288,6 +2464,8 @@ bool BookmarkModel::MoveBookmark(BookmarkSource /*src_source*/,
 
   BookmarkOp op;
   op.kind = BookmarkOp::Kind::kMove;
+  op.src_source = src_source;
+  op.dst_source = dst_source;
   op.id = WideToUtf8(src_id);
   op.guid = WideToUtf8(src_guid);
   op.dst_folder_id = WideToUtf8(dst_folder_id);
@@ -2296,19 +2474,47 @@ bool BookmarkModel::MoveBookmark(BookmarkSource /*src_source*/,
   op.anchor_guid = WideToUtf8(anchor_guid);
   op.insert_after = insert_after;
 
-  auto ops = LoadJournalFromDisk(profile_dir);
-  AppendAndCompactOp(ops, std::move(op));
-  if (!SaveJournalToDisk(profile_dir, ops)) {
-    return false;
+  if (snapshot) {
+    if (const BookmarkNode* src = FindNodeConst(*snapshot, src_id, src_guid)) {
+      op.src_source = src->source;
+      op.is_folder = src->is_folder;
+      op.orig_title = WideToUtf8(src->title);
+      op.orig_url = WideToUtf8(src->url);
+    }
+    if (dst_folder_id != L"__bookmark_bar__" && dst_folder_id != L"__other__") {
+      if (const BookmarkNode* dst =
+              FindNodeConst(*snapshot, dst_folder_id, dst_folder_guid)) {
+        op.dst_source = dst->source;
+        op.dst_folder_title = WideToUtf8(dst->title);
+      }
+    }
+    if (!anchor_id.empty() || !anchor_guid.empty()) {
+      if (const BookmarkNode* anc =
+              FindNodeConst(*snapshot, anchor_id, anchor_guid)) {
+        op.anchor_title = WideToUtf8(anc->title);
+        op.anchor_url = WideToUtf8(anc->url);
+      }
+    }
   }
 
-  // Best-effort mirror to Chrome's own Bookmarks/AccountBookmarks files.
-  FlushJournalToProfileFiles(profile_dir, ops);
+  {
+    auto& store = GetStore();
+    std::lock_guard jlock(store.journal_mutex);
+    auto ops = LoadJournalFromDisk(profile_dir);
+    AppendAndCompactOp(ops, std::move(op));
+    if (!SaveJournalToDisk(profile_dir, ops)) {
+      return false;
+    }
+    if (!IsBookmarksPakPatched()) {
+      FlushJournalToProfileFiles(profile_dir, ops);
+    }
+  }
+
   EnsureLoaded(show_other_bookmarks, /*force=*/true);
   return true;
 }
 
-bool BookmarkModel::UpdateBookmark(BookmarkSource /*source*/,
+bool BookmarkModel::UpdateBookmark(BookmarkSource source,
                                    const std::wstring& node_id,
                                    const std::wstring& node_guid,
                                    const std::wstring& new_title,
@@ -2320,10 +2526,12 @@ bool BookmarkModel::UpdateBookmark(BookmarkSource /*source*/,
   }
 
   std::wstring profile_dir;
+  std::shared_ptr<const std::vector<BookmarkNode>> snapshot;
   {
     auto& store = GetStore();
     std::lock_guard lock(store.mutex);
     profile_dir = store.profile_dir;
+    snapshot = store.root_items;
   }
   if (profile_dir.empty()) {
     return false;
@@ -2331,6 +2539,8 @@ bool BookmarkModel::UpdateBookmark(BookmarkSource /*source*/,
 
   BookmarkOp op;
   op.kind = BookmarkOp::Kind::kUpdate;
+  op.src_source = source;
+  op.dst_source = source;
   op.id = WideToUtf8(node_id);
   op.guid = WideToUtf8(node_guid);
   op.title = WideToUtf8(new_title);
@@ -2338,14 +2548,29 @@ bool BookmarkModel::UpdateBookmark(BookmarkSource /*source*/,
   if (new_url.has_value()) {
     op.url = WideToUtf8(*new_url);
   }
-
-  auto ops = LoadJournalFromDisk(profile_dir);
-  AppendAndCompactOp(ops, std::move(op));
-  if (!SaveJournalToDisk(profile_dir, ops)) {
-    return false;
+  if (snapshot) {
+    if (const BookmarkNode* hit = FindNodeConst(*snapshot, node_id, node_guid)) {
+      op.src_source = hit->source;
+      op.dst_source = hit->source;
+      op.is_folder = hit->is_folder;
+      op.orig_title = WideToUtf8(hit->title);
+      op.orig_url = WideToUtf8(hit->url);
+    }
   }
 
-  FlushJournalToProfileFiles(profile_dir, ops);
+  {
+    auto& store = GetStore();
+    std::lock_guard jlock(store.journal_mutex);
+    auto ops = LoadJournalFromDisk(profile_dir);
+    AppendAndCompactOp(ops, std::move(op));
+    if (!SaveJournalToDisk(profile_dir, ops)) {
+      return false;
+    }
+    if (!IsBookmarksPakPatched()) {
+      FlushJournalToProfileFiles(profile_dir, ops);
+    }
+  }
+
   EnsureLoaded(show_other_bookmarks, /*force=*/true);
   return true;
 }
@@ -2365,10 +2590,12 @@ bool BookmarkModel::AddBookmarkOrFolder(BookmarkSource dst_source,
   }
 
   std::wstring profile_dir;
+  std::shared_ptr<const std::vector<BookmarkNode>> snapshot;
   {
     auto& store = GetStore();
     std::lock_guard lock(store.mutex);
     profile_dir = store.profile_dir;
+    snapshot = store.root_items;
   }
   if (profile_dir.empty()) {
     return false;
@@ -2382,6 +2609,7 @@ bool BookmarkModel::AddBookmarkOrFolder(BookmarkSource dst_source,
 
   BookmarkOp op;
   op.kind = BookmarkOp::Kind::kAdd;
+  op.src_source = dst_source;
   op.dst_source = dst_source;
   op.id = new_id;
   op.guid = new_guid;
@@ -2394,18 +2622,42 @@ bool BookmarkModel::AddBookmarkOrFolder(BookmarkSource dst_source,
   op.title = WideToUtf8(title.empty() ? url : title);
   op.url = WideToUtf8(url);
 
-  auto ops = LoadJournalFromDisk(profile_dir);
-  AppendAndCompactOp(ops, std::move(op));
-  if (!SaveJournalToDisk(profile_dir, ops)) {
-    return false;
+  if (snapshot) {
+    if (dst_folder_id != L"__bookmark_bar__" && dst_folder_id != L"__other__") {
+      if (const BookmarkNode* dst =
+              FindNodeConst(*snapshot, dst_folder_id, dst_folder_guid)) {
+        op.dst_source = dst->source;
+        op.src_source = dst->source;
+        op.dst_folder_title = WideToUtf8(dst->title);
+      }
+    }
+    if (!anchor_id.empty() || !anchor_guid.empty()) {
+      if (const BookmarkNode* anc =
+              FindNodeConst(*snapshot, anchor_id, anchor_guid)) {
+        op.anchor_title = WideToUtf8(anc->title);
+        op.anchor_url = WideToUtf8(anc->url);
+      }
+    }
   }
 
-  FlushJournalToProfileFiles(profile_dir, ops);
+  {
+    auto& store = GetStore();
+    std::lock_guard jlock(store.journal_mutex);
+    auto ops = LoadJournalFromDisk(profile_dir);
+    AppendAndCompactOp(ops, std::move(op));
+    if (!SaveJournalToDisk(profile_dir, ops)) {
+      return false;
+    }
+    if (!IsBookmarksPakPatched()) {
+      FlushJournalToProfileFiles(profile_dir, ops);
+    }
+  }
+
   EnsureLoaded(show_other_bookmarks, /*force=*/true);
   return true;
 }
 
-bool BookmarkModel::DeleteBookmark(BookmarkSource /*source*/,
+bool BookmarkModel::DeleteBookmark(BookmarkSource source,
                                    const std::wstring& node_id,
                                    const std::wstring& node_guid,
                                    bool show_other_bookmarks) {
@@ -2415,10 +2667,12 @@ bool BookmarkModel::DeleteBookmark(BookmarkSource /*source*/,
   }
 
   std::wstring profile_dir;
+  std::shared_ptr<const std::vector<BookmarkNode>> snapshot;
   {
     auto& store = GetStore();
     std::lock_guard lock(store.mutex);
     profile_dir = store.profile_dir;
+    snapshot = store.root_items;
   }
   if (profile_dir.empty()) {
     return false;
@@ -2426,21 +2680,45 @@ bool BookmarkModel::DeleteBookmark(BookmarkSource /*source*/,
 
   BookmarkOp op;
   op.kind = BookmarkOp::Kind::kDelete;
+  op.src_source = source;
+  op.dst_source = source;
   op.id = WideToUtf8(node_id);
   op.guid = WideToUtf8(node_guid);
-
-  auto ops = LoadJournalFromDisk(profile_dir);
-  AppendAndCompactOp(ops, std::move(op));
-  if (!SaveJournalToDisk(profile_dir, ops)) {
-    return false;
+  if (snapshot) {
+    if (const BookmarkNode* hit = FindNodeConst(*snapshot, node_id, node_guid)) {
+      op.src_source = hit->source;
+      op.dst_source = hit->source;
+      op.is_folder = hit->is_folder;
+      op.orig_title = WideToUtf8(hit->title);
+      op.orig_url = WideToUtf8(hit->url);
+    }
   }
 
-  FlushJournalToProfileFiles(profile_dir, ops);
+  {
+    auto& store = GetStore();
+    std::lock_guard jlock(store.journal_mutex);
+    auto ops = LoadJournalFromDisk(profile_dir);
+    AppendAndCompactOp(ops, std::move(op));
+    if (!SaveJournalToDisk(profile_dir, ops)) {
+      return false;
+    }
+    if (!IsBookmarksPakPatched()) {
+      FlushJournalToProfileFiles(profile_dir, ops);
+    }
+  }
+
   EnsureLoaded(show_other_bookmarks, /*force=*/true);
   return true;
 }
 
-void BookmarkModel::FlushPendingOpsToChromeFiles() {
+std::optional<std::wstring> BookmarkModel::BuildLiveSyncUrl(
+    std::string_view base_url,
+    std::string_view token,
+    uint64_t* out_max_seq) {
+  if (!IsBookmarksPakPatched()) {
+    return std::nullopt;
+  }
+
   std::wstring profile_dir;
   {
     auto& store = GetStore();
@@ -2448,11 +2726,221 @@ void BookmarkModel::FlushPendingOpsToChromeFiles() {
     profile_dir = store.profile_dir;
   }
   if (profile_dir.empty()) {
+    if (auto detected = FindBestActiveProfileDir(nullptr)) {
+      profile_dir = *detected;
+    } else {
+      return std::nullopt;
+    }
+  }
+
+  std::vector<BookmarkOp> pending;
+  uint64_t max_seq = 0;
+  {
+    auto& store = GetStore();
+    std::lock_guard jlock(store.journal_mutex);
+    const auto all_ops = LoadJournalFromDisk(profile_dir);
+    for (const auto& op : all_ops) {
+      if (!op.synced) {
+        if (op.seq > max_seq) {
+          max_seq = op.seq;
+        }
+        pending.push_back(op);
+      }
+    }
+  }
+  if (pending.empty()) {
+    return std::nullopt;
+  }
+  if (out_max_seq) {
+    *out_max_seq = max_seq;
+  }
+
+  auto make_bool = [](bool b) {
+    JsonValue jv;
+    jv.type = JsonValue::Type::kBool;
+    jv.bool_val = b;
+    return jv;
+  };
+
+  JsonValue payload;
+  payload.type = JsonValue::Type::kObject;
+  if (!base_url.empty() && !token.empty()) {
+    std::string ack(base_url);
+    if (!ack.empty() && ack.back() != '/') {
+      ack.push_back('/');
+    }
+    ack += "api/bm-ack?token=";
+    ack += token;
+    ack += "&seq=";
+    ack += std::to_string(max_seq);
+    payload.SetString("ack", ack);
+  }
+
+  JsonValue ops_arr;
+  ops_arr.type = JsonValue::Type::kArray;
+  ops_arr.arr_val.reserve(pending.size());
+  for (const auto& op : pending) {
+    JsonValue o;
+    o.type = JsonValue::Type::kObject;
+    switch (op.kind) {
+      case BookmarkOp::Kind::kDelete:
+        o.SetString("k", "d");
+        break;
+      case BookmarkOp::Kind::kUpdate:
+        o.SetString("k", "u");
+        break;
+      case BookmarkOp::Kind::kAdd:
+        o.SetString("k", "a");
+        break;
+      case BookmarkOp::Kind::kMove:
+        o.SetString("k", "m");
+        break;
+    }
+    if (!op.id.empty()) o.SetString("id", op.id);
+    if (!op.orig_title.empty()) o.SetString("ot", op.orig_title);
+    if (!op.orig_url.empty()) o.SetString("ou", op.orig_url);
+    o.obj_val.emplace_back("f", make_bool(op.is_folder));
+    o.SetString("ss", op.src_source == BookmarkSource::kAccount ? "a" : "l");
+    o.SetString("ds", op.dst_source == BookmarkSource::kAccount ? "a" : "l");
+    if (op.kind == BookmarkOp::Kind::kUpdate ||
+        op.kind == BookmarkOp::Kind::kAdd) {
+      o.SetString("t", op.title);
+      if (op.has_url || !op.url.empty()) {
+        o.SetString("u", op.url);
+      }
+      if (op.kind == BookmarkOp::Kind::kUpdate) {
+        o.obj_val.emplace_back("hu", make_bool(op.has_url));
+      }
+    }
+    if (op.kind == BookmarkOp::Kind::kMove ||
+        op.kind == BookmarkOp::Kind::kAdd) {
+      if (!op.dst_folder_id.empty()) o.SetString("df", op.dst_folder_id);
+      if (!op.dst_folder_title.empty()) o.SetString("dt", op.dst_folder_title);
+      if (!op.anchor_id.empty()) o.SetString("ai", op.anchor_id);
+      if (!op.anchor_title.empty()) o.SetString("at", op.anchor_title);
+      if (!op.anchor_url.empty()) o.SetString("au", op.anchor_url);
+      o.obj_val.emplace_back("ia", make_bool(op.insert_after));
+    }
+    ops_arr.arr_val.push_back(std::move(o));
+  }
+  payload.obj_val.emplace_back("ops", std::move(ops_arr));
+
+  std::string json;
+  json.reserve(1024);
+  SerializeJsonValue(json, payload, 0);
+  const std::string encoded = Base64UrlEncode(json);
+  return L"chrome://bookmarks/#cp_sync=" + Utf8ToWide(encoded);
+}
+
+void BookmarkModel::MarkOpsSynced(
+    uint64_t up_to_seq,
+    const std::vector<std::pair<std::string, std::string>>& id_map) {
+  std::wstring profile_dir;
+  {
+    auto& store = GetStore();
+    std::lock_guard lock(store.mutex);
+    profile_dir = store.profile_dir;
+  }
+  if (profile_dir.empty()) {
+    if (auto detected = FindBestActiveProfileDir(nullptr)) {
+      profile_dir = *detected;
+    } else {
+      return;
+    }
+  }
+
+  auto& store = GetStore();
+  std::lock_guard jlock(store.journal_mutex);
+  auto ops = LoadJournalFromDisk(profile_dir);
+  if (ops.empty()) {
     return;
   }
-  const auto ops = LoadJournalFromDisk(profile_dir);
+
+  const CombinedBookmarkStamp stamp = GetProfileBookmarkStamp(profile_dir);
+  const uint64_t cur_local =
+      stamp.local_stamp ? stamp.local_stamp->write_time : 0;
+  const uint64_t cur_account =
+      stamp.account_stamp ? stamp.account_stamp->write_time : 0;
+
+  bool changed = false;
+  for (auto& op : ops) {
+    if (op.seq <= up_to_seq && !op.synced) {
+      op.synced = true;
+      op.synced_local_ts = cur_local;
+      op.synced_account_ts = cur_account;
+      changed = true;
+    }
+    for (const auto& [old_id, new_id] : id_map) {
+      if (op.id == old_id) {
+        op.id = new_id;
+        // Chrome generated its own GUID when creating the node; clear our
+        // synthetic GUID so dedup/match falls back to the real Chrome ID.
+        if (op.kind == BookmarkOp::Kind::kAdd) {
+          op.guid.clear();
+        }
+        changed = true;
+      }
+      if (op.dst_folder_id == old_id) {
+        op.dst_folder_id = new_id;
+        changed = true;
+      }
+      if (op.anchor_id == old_id) {
+        op.anchor_id = new_id;
+        changed = true;
+      }
+    }
+  }
+
+  if (changed) {
+    SaveJournalToDisk(profile_dir, ops);
+  }
+}
+
+void BookmarkModel::FlushPendingOpsToChromeFiles(bool is_pre_launch) {
+  std::wstring profile_dir;
+  {
+    auto& store = GetStore();
+    std::lock_guard lock(store.mutex);
+    profile_dir = store.profile_dir;
+  }
+  if (profile_dir.empty()) {
+    if (auto detected = FindBestActiveProfileDir(nullptr)) {
+      profile_dir = *detected;
+    } else {
+      return;
+    }
+  }
+
+  auto& store = GetStore();
+  std::lock_guard jlock(store.journal_mutex);
+  auto ops = LoadJournalFromDisk(profile_dir);
+  if (ops.empty()) {
+    return;
+  }
+
+  const CombinedBookmarkStamp stamp = GetProfileBookmarkStamp(profile_dir);
+  const size_t before_count = ops.size();
+  std::erase_if(ops, [&](const BookmarkOp& op) {
+    return IsSyncedOpFlushedByChrome(op, stamp);
+  });
+  bool dirty = (ops.size() != before_count);
   if (!ops.empty()) {
     FlushJournalToProfileFiles(profile_dir, ops);
+    if (is_pre_launch) {
+      // Chrome hasn't loaded Bookmarks yet, so kAdd entries flushed to disk
+      // right now will be loaded natively by Chrome; remove them so live sync
+      // doesn't re-create duplicates.
+      const size_t n = ops.size();
+      std::erase_if(ops, [](const BookmarkOp& op) {
+        return op.kind == BookmarkOp::Kind::kAdd;
+      });
+      if (ops.size() != n) {
+        dirty = true;
+      }
+    }
+  }
+  if (dirty) {
+    SaveJournalToDisk(profile_dir, ops);
   }
 }
 

@@ -7,6 +7,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 enum class BookmarkSource {
@@ -89,10 +91,23 @@ class BookmarkModel {
                       const std::wstring& node_guid,
                       bool show_other_bookmarks);
 
+  // Builds a `chrome://bookmarks/#cp_sync=<base64url>` URL carrying all
+  // unsynced ops so patched `chrome://bookmarks` applies them to Chrome's live
+  // BookmarkModel and native bookmark bar immediately.
+  std::optional<std::wstring> BuildLiveSyncUrl(std::string_view base_url,
+                                               std::string_view token,
+                                               uint64_t* out_max_seq = nullptr);
+
+  // Marks all pending ops with seq <= up_to_seq as synced into Chrome's live
+  // BookmarkModel, remapping any temporary `cp_*` IDs to Chrome's assigned IDs.
+  void MarkOpsSynced(
+      uint64_t up_to_seq,
+      const std::vector<std::pair<std::string, std::string>>& id_map);
+
   // Re-applies all durable Chrome++ bookmark edits onto Chrome's on-disk
-  // Bookmarks/AccountBookmarks files (called on browser exit so Chrome's native
-  // bookmark bar picks up the changes on next start).
-  void FlushPendingOpsToChromeFiles();
+  // Bookmarks/AccountBookmarks files (called at browser startup before Chrome
+  // loads bookmarks and at browser exit as fallback).
+  void FlushPendingOpsToChromeFiles(bool is_pre_launch = false);
 
   // Returns diagnostic status when root items are empty.
   std::wstring GetDiagnosticInfo() const;

@@ -162,10 +162,11 @@ void PaintLayeredButton(ButtonEntry* entry) {
       const bool dark = (config.GetBookmarksTheme() == 2) ||
                         (config.GetBookmarksTheme() == 0 && IsSystemDarkTheme());
 
-      // Subtle pill background (also gives reliable hit-testing via alpha >= 1)
+      // Invisible 1/255 hit-test fill when idle so no gray box clips the
+      // adjacent address bar; Chrome-style circular pill on hover/active.
       D2D1_COLOR_F pill_bg =
-          dark ? D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.02f)
-               : D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.02f);
+          dark ? D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.004f)
+               : D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.004f);
       if (entry->pressed) {
         pill_bg = dark ? D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.18f)
                        : D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.14f);
@@ -176,12 +177,11 @@ void PaintLayeredButton(ButtonEntry* entry) {
 
       ComPtr<ID2D1SolidColorBrush> bg_brush;
       dc_rt->CreateSolidColorBrush(pill_bg, &bg_brush);
-      const float r = static_cast<float>(ScalePx(6, entry->dpi));
-      dc_rt->FillRoundedRectangle(
-          D2D1::RoundedRect(
-              D2D1::RectF(1.0f, 1.0f, static_cast<float>(w) - 1.0f,
-                          static_cast<float>(h) - 1.0f),
-              r, r),
+      const float cx = static_cast<float>(w) * 0.5f;
+      const float cy = static_cast<float>(h) * 0.5f;
+      const float pill_r = static_cast<float>(w) * 0.45f;
+      dc_rt->FillEllipse(
+          D2D1::Ellipse(D2D1::Point2F(cx, cy), pill_r, pill_r),
           bg_brush.Get());
 
       // Draw crisp 5-point star icon
@@ -189,9 +189,8 @@ void PaintLayeredButton(ButtonEntry* entry) {
       if (SUCCEEDED(mgr.d2d_factory->CreatePathGeometry(&star_geo))) {
         ComPtr<ID2D1GeometrySink> sink;
         if (SUCCEEDED(star_geo->Open(&sink))) {
-          const float cx = static_cast<float>(w) * 0.5f;
-          const float cy = static_cast<float>(h) * 0.5f + 0.5f;
-          const float outer_r = static_cast<float>(w) * 0.30f;
+          const float star_cy = cy + 0.5f;
+          const float outer_r = static_cast<float>(w) * 0.28f;
           const float inner_r = outer_r * 0.44f;
           constexpr double kPi = std::numbers::pi;
           for (int i = 0; i < 10; ++i) {
@@ -199,7 +198,7 @@ void PaintLayeredButton(ButtonEntry* entry) {
             const float rad = (i % 2 == 0) ? outer_r : inner_r;
             const D2D1_POINT_2F pt = D2D1::Point2F(
                 cx + static_cast<float>(std::cos(angle)) * rad,
-                cy + static_cast<float>(std::sin(angle)) * rad);
+                star_cy + static_cast<float>(std::sin(angle)) * rad);
             if (i == 0) {
               sink->BeginFigure(pt, D2D1_FIGURE_BEGIN_FILLED);
             } else {
@@ -266,7 +265,11 @@ void UpdateButtonPosition(ButtonEntry* entry) {
   int x = 0;
   int y = 0;
   if (anchor_mode == 0) {
-    x = anchor->rect.left - new_sz - ScalePx(4, entry->dpi) + off_x;
+    if (anchor->has_gap_left) {
+      x = (anchor->gap_left + anchor->rect.left - new_sz) / 2 + off_x;
+    } else {
+      x = anchor->rect.left - new_sz - ScalePx(2, entry->dpi) + off_x;
+    }
     y = (anchor->rect.top + anchor->rect.bottom - new_sz) / 2 + off_y;
   } else if (anchor_mode == 1) {
     x = anchor->rect.left + ScalePx(4, entry->dpi) + off_x;

@@ -1483,7 +1483,22 @@ std::optional<BookmarkAnchorRect> FindBookmarkButtonAnchor(HWND hwnd,
     return std::nullopt;
   }
 
-  return BookmarkAnchorRect{rect, true};
+  BookmarkAnchorRect out{rect, true, 0, false};
+  if (anchor_mode == 0 && session->control_view_walker) {
+    ComPtr<IUIAutomationElement> prev;
+    if (SUCCEEDED(session->control_view_walker->GetPreviousSiblingElement(
+            target.Get(), prev.ReleaseAndGetAddressOf())) &&
+        prev) {
+      RECT prev_rc{};
+      if (SUCCEEDED(prev->get_CurrentBoundingRectangle(&prev_rc)) &&
+          !IsRectEmpty(&prev_rc) && prev_rc.right <= rect.left &&
+          rect.left - prev_rc.right < 120) {
+        out.gap_left = prev_rc.right;
+        out.has_gap_left = true;
+      }
+    }
+  }
+  return out;
 }
 
 bool IsChromeWindowFullscreen(HWND hwnd) {
