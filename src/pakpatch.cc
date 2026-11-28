@@ -154,36 +154,43 @@ void PublishPatchedEntry(uint8_t* buffer,
 
 // Renderer fast path: overwrite this process's copy-on-write pak view with
 // the browser's already-patched bytes.
-bool ApplyPatchedEntry(uint8_t* buffer, const PakPatchTarget& target) {
+uint16_t ApplyPatchedEntry(uint8_t* buffer, const PakPatchTarget& target) {
   wchar_t name[64];
   DWORD len = GetEnvironmentVariableW(target.blob_env, name, ARRAYSIZE(name));
   if (len == 0 || len >= ARRAYSIZE(name)) {
-    return false;
+    return 0;
   }
 
   HANDLE section = OpenFileMappingW(FILE_MAP_READ, FALSE, name);
   if (!section) {
-    return false;
+    return 0;
   }
 
-  bool applied = false;
+  uint16_t applied_id = 0;
   if (const auto* view = static_cast<const uint8_t*>(
           MapViewOfFile(section, FILE_MAP_READ, 0, 0, 0))) {
-    const auto* header = reinterpret_cast<const PakBlobHeader*>(view);
-    std::optional<PakResourceSlot> slot;
-    if (header->resource_id <= 0xFFFF) {
-      slot =
-          FindResourceSlot(buffer, static_cast<uint16_t>(header->resource_id));
-    }
-    if (slot && slot->length == header->length) {
-      memcpy(buffer + slot->offset, view + sizeof(PakBlobHeader), slot->length);
-      applied = true;
-      DebugLog(L"PakPatch: applied published resource {}", header->resource_id);
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(view, &mbi, sizeof(mbi)) &&
+        mbi.RegionSize >= sizeof(PakBlobHeader)) {
+      const auto* header = reinterpret_cast<const PakBlobHeader*>(view);
+      std::optional<PakResourceSlot> slot;
+      if (header->resource_id > 0 && header->resource_id <= 0xFFFF &&
+          header->length <= mbi.RegionSize - sizeof(PakBlobHeader)) {
+        slot = FindResourceSlot(buffer,
+                                static_cast<uint16_t>(header->resource_id));
+      }
+      if (slot && slot->length == header->length) {
+        memcpy(buffer + slot->offset, view + sizeof(PakBlobHeader),
+               slot->length);
+        applied_id = static_cast<uint16_t>(header->resource_id);
+        DebugLog(L"PakPatch: applied published resource {}",
+                 header->resource_id);
+      }
     }
     UnmapViewOfFile(view);
   }
   CloseHandle(section);
-  return applied;
+  return applied_id;
 }
 
 // The #172 settings-page injection, run on each candidate decompressed pak
@@ -259,20 +266,39 @@ void CompactJsForPakPatch(std::string& js) {
     while (e > s && (js[e - 1] == ' ' || js[e - 1] == '\t' || js[e - 1] == '\r')) {
       --e;
     }
-    const std::string_view line(js.data() + s, e - s);
+    std::string_view line(js.data() + s, e - s);
     if (in_license_block) {
-      if (line.find("*/") != std::string_view::npos) {
+      const size_t end_c = line.find("*/");
+      if (end_c != std::string_view::npos) {
         in_license_block = false;
+        line = line.substr(end_c + 2);
+        while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) {
+          line.remove_prefix(1);
+        }
+        if (line.empty()) {
+          i = (eol < n) ? (eol + 1) : n;
+          continue;
+        }
+      } else {
+        i = (eol < n) ? (eol + 1) : n;
+        continue;
       }
-      i = (eol < n) ? (eol + 1) : n;
-      continue;
     }
     if (line.starts_with("/*") && line.find("Copyright") != std::string_view::npos) {
-      if (line.find("*/") == std::string_view::npos) {
+      const size_t end_c = line.find("*/");
+      if (end_c == std::string_view::npos) {
         in_license_block = true;
+        i = (eol < n) ? (eol + 1) : n;
+        continue;
       }
-      i = (eol < n) ? (eol + 1) : n;
-      continue;
+      line = line.substr(end_c + 2);
+      while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) {
+        line.remove_prefix(1);
+      }
+      if (line.empty()) {
+        i = (eol < n) ? (eol + 1) : n;
+        continue;
+      }
     }
     const bool drop =
         line.empty() || line.starts_with("// Copyright") ||
@@ -428,8 +454,8 @@ constexpr PakPatchTarget kBookmarksTarget{
     .blob_env = L"CHROME_PLUS_PAK_BM_BLOB",
     .section_prefix = L"Local\\ChromePlusPakBmBlob_",
     .cache_name = L"Chrome++_PakCache_Bm.bin",
-    .build_tag = RELEASE_VER_STR BUILD_ARCH "-bm-sync-v1",
-    .min_entry_size = 2 * 1024,
+    .build_tag = RELEASE_VER_STR BUILD_ARCH "-bm-sync-v2",
+    .min_entry_size = 10 * 1024,
     .patch_fn = PatchBookmarksJs,
 };
 
@@ -582,13 +608,19 @@ void SaveResultToCache(uint8_t* buffer,
   }
 }
 
-uint16_t PatchOneTarget(uint8_t* buffer,
-                        const PakPatchTarget& target,
-                        size_t slot_index) {
+__declspec(noinline) uint16_t PatchOneTarget(uint8_t* buffer,
+                                             const PakPatchTarget& target,
+                                             size_t slot_index,
+                                             uint16_t skip_resource_id) {
   const bool is_browser = IsBrowserProcess();
-  if (!is_browser &&
-      (IsPakTargetMissing(target.id_env) || ApplyPatchedEntry(buffer, target))) {
-    return 1;
+  if (!is_browser) {
+    if (IsPakTargetMissing(target.id_env)) {
+      return 0;
+    }
+    if (const uint16_t applied = ApplyPatchedEntry(buffer, target);
+        applied != 0) {
+      return applied;
+    }
   }
 
   std::optional<uint16_t> cached_id;
@@ -604,10 +636,10 @@ uint16_t PatchOneTarget(uint8_t* buffer,
     const uint16_t target_id =
         cached_hint_id != 0 ? cached_hint_id : GetPakTargetId(target.id_env);
     matched_id = PatchPakResource(buffer, target.patch_fn, target_id,
-                                  target.min_entry_size);
+                                  target.min_entry_size, skip_resource_id);
     if (matched_id == 0 && target_id != 0) {
-      matched_id =
-          PatchPakResource(buffer, target.patch_fn, 0, target.min_entry_size);
+      matched_id = PatchPakResource(buffer, target.patch_fn, 0,
+                                    target.min_entry_size, skip_resource_id);
     }
     if (is_browser && resources_pak_identity) {
       SaveResultToCache(buffer, matched_id, *resources_pak_identity, target);
@@ -627,9 +659,17 @@ uint16_t PatchOneTarget(uint8_t* buffer,
   return matched_id;
 }
 
+uint16_t SafePatchBookmarksTarget(uint8_t* buffer, uint16_t skip_id) {
+  __try {
+    return PatchOneTarget(buffer, kBookmarksTarget, 1, skip_id);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return 0;
+  }
+}
+
 void PatchResourcesPak(uint8_t* buffer) {
-  PatchOneTarget(buffer, kSettingsTarget, 0);
-  const uint16_t bm_id = PatchOneTarget(buffer, kBookmarksTarget, 1);
+  const uint16_t settings_id = PatchOneTarget(buffer, kSettingsTarget, 0, 0);
+  const uint16_t bm_id = SafePatchBookmarksTarget(buffer, settings_id);
   if (IsBrowserProcess() && bm_id != 0) {
     g_bookmarks_pak_patched.store(true, std::memory_order_relaxed);
   }

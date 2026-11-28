@@ -104,10 +104,9 @@ class BookmarkModel {
       uint64_t up_to_seq,
       const std::vector<std::pair<std::string, std::string>>& id_map);
 
-  // Re-applies all durable Chrome++ bookmark edits onto Chrome's on-disk
-  // Bookmarks/AccountBookmarks files (called at browser startup before Chrome
-  // loads bookmarks and at browser exit as fallback).
-  void FlushPendingOpsToChromeFiles(bool is_pre_launch = false);
+  // Re-applies unsynced Chrome++ bookmark edits onto Chrome's on-disk
+  // Bookmarks/AccountBookmarks files on browser exit as fallback.
+  void FlushPendingOpsToChromeFiles();
 
   // Returns diagnostic status when root items are empty.
   std::wstring GetDiagnosticInfo() const;

@@ -2896,7 +2896,7 @@ void BookmarkModel::MarkOpsSynced(
   }
 }
 
-void BookmarkModel::FlushPendingOpsToChromeFiles(bool is_pre_launch) {
+void BookmarkModel::FlushPendingOpsToChromeFiles() {
   std::wstring profile_dir;
   {
     auto& store = GetStore();
@@ -2904,11 +2904,7 @@ void BookmarkModel::FlushPendingOpsToChromeFiles(bool is_pre_launch) {
     profile_dir = store.profile_dir;
   }
   if (profile_dir.empty()) {
-    if (auto detected = FindBestActiveProfileDir(nullptr)) {
-      profile_dir = *detected;
-    } else {
-      return;
-    }
+    return;
   }
 
   auto& store = GetStore();
@@ -2923,24 +2919,20 @@ void BookmarkModel::FlushPendingOpsToChromeFiles(bool is_pre_launch) {
   std::erase_if(ops, [&](const BookmarkOp& op) {
     return IsSyncedOpFlushedByChrome(op, stamp);
   });
-  bool dirty = (ops.size() != before_count);
-  if (!ops.empty()) {
-    FlushJournalToProfileFiles(profile_dir, ops);
-    if (is_pre_launch) {
-      // Chrome hasn't loaded Bookmarks yet, so kAdd entries flushed to disk
-      // right now will be loaded natively by Chrome; remove them so live sync
-      // doesn't re-create duplicates.
-      const size_t n = ops.size();
-      std::erase_if(ops, [](const BookmarkOp& op) {
-        return op.kind == BookmarkOp::Kind::kAdd;
-      });
-      if (ops.size() != n) {
-        dirty = true;
-      }
+  if (ops.size() != before_count) {
+    SaveJournalToDisk(profile_dir, ops);
+  }
+
+  // Only flush ops that have NOT already been live-synced into Chrome's
+  // in-memory BookmarkModel, so we don't race with Chrome's own shutdown save.
+  std::vector<BookmarkOp> unsynced;
+  for (const auto& op : ops) {
+    if (!op.synced) {
+      unsynced.push_back(op);
     }
   }
-  if (dirty) {
-    SaveJournalToDisk(profile_dir, ops);
+  if (!unsynced.empty()) {
+    FlushJournalToProfileFiles(profile_dir, unsynced);
   }
 }
 
