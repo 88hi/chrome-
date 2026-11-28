@@ -160,6 +160,9 @@ void InstallExitHook() {
 }
 
 void ChromePlusCommand(LPWSTR param) {
+  if (GetSwitchValue(param, L"--cp-handoff").has_value()) {
+    return;
+  }
   if (config.IsManagedUpdates() &&
       GetSwitchValue(param, kFinishUpdateSwitch).has_value()) {
     ExitProcess(FinishUpdate());

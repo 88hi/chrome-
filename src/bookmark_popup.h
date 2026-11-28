@@ -12,6 +12,8 @@ void ToggleBookmarkPopup(HWND chrome_root,
 void CloseAllBookmarkPopups();
 bool IsBookmarkPopupOpen();
 bool IsBookmarkPopupWindow(HWND hwnd);
+bool IsNativeBookmarkPopupWindow(HWND hwnd);
+void CloseOrphanNativeBookmarkPopup();
 void RefreshOpenBookmarkPopups();
 uint32_t GetLiveSyncDispatchCount();
 

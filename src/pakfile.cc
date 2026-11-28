@@ -234,7 +234,7 @@ bool WriteZstdEntry(std::span<const uint8_t> content,
   auto encoded = std::make_unique_for_overwrite<uint8_t[]>(entry.size());
   size_t frame_size = 0;
   bool fit = false;
-  for (const int level : {kZstdLevel, 19}) {
+  for (const int level : {kZstdLevel, 14}) {
     frame_size = ZSTD_compress(encoded.get(), entry.size(), content.data(),
                                content.size(), level);
     if (!ZSTD_isError(frame_size)) {

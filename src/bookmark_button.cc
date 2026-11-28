@@ -383,7 +383,7 @@ LRESULT CALLBACK ButtonWndProc(HWND hwnd,
 
 BOOL CALLBACK EnumChromeRootsProc(HWND hwnd, LPARAM lParam) {
   auto* list = reinterpret_cast<std::vector<HWND>*>(lParam);
-  if (!IsChromeWindow(hwnd)) {
+  if (!IsChromeWindow(hwnd) || IsNativeBookmarkPopupWindow(hwnd)) {
     return TRUE;
   }
   DWORD pid = 0;
@@ -398,6 +398,21 @@ void SyncButtonsWithChromeWindows() {
   auto& mgr = GetBtnManager();
   std::vector<HWND> roots;
   ::EnumWindows(EnumChromeRootsProc, reinterpret_cast<LPARAM>(&roots));
+
+  static bool s_had_browser_window = false;
+  int active_browsers = 0;
+  for (HWND r : roots) {
+    if (::IsWindowVisible(r) || ::IsIconic(r)) {
+      ++active_browsers;
+    }
+  }
+  if (active_browsers > 0) {
+    s_had_browser_window = true;
+  } else if (s_had_browser_window) {
+    // All normal Chrome browser windows were closed: close any hidden native
+    // bookmark popup so Chrome exits cleanly with zero orphan process.
+    CloseOrphanNativeBookmarkPopup();
+  }
 
   // Remove stale buttons for closed Chrome windows.
   for (auto it = mgr.buttons.begin(); it != mgr.buttons.end();) {

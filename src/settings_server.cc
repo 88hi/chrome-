@@ -335,11 +335,9 @@ std::string BuildConfigJson() {
                   GetIniInt(L"bookmarks", L"show_other_bookmarks", 1) != 0,
                   first);
   const std::string sync_diag =
-      "pak=" + GetBookmarksPakDiagnostic() + " | pending=" +
-      std::to_string(BookmarkModel::Instance().GetPendingSyncOpCount()) +
-      " | sent=" + std::to_string(GetLiveSyncDispatchCount()) + " | ack=" +
-      std::to_string(g_bm_ack_count.load(std::memory_order_relaxed)) + " (ok=" +
-      std::to_string(g_bm_last_ack_ok.load(std::memory_order_relaxed)) + ")";
+      "mode=" + std::string(IsBookmarksPakPatched() ? "native_centered" : "fallback") +
+      " | pak=" + GetBookmarksPakDiagnostic() +
+      " | opens=" + std::to_string(GetLiveSyncDispatchCount());
   AppendJsonField(json, "sync_diag", sync_diag, first);
   json += "}}";
   return json;
@@ -764,7 +762,7 @@ input[type=checkbox]{width:18px;height:18px;accent-color:var(--accent);cursor:po
     <div class="row"><div class="label"><span class="t">自定义文字色 (text_color)</span><span class="d">theme=3 时生效，十六进制如 #202124</span></div><input type="text" id="bookmarks.text_color"></div>
     <div class="row"><div class="label"><span class="t">自定义悬停高亮色 (hover_color)</span><span class="d">theme=3 时生效，十六进制如 #E8F0FE</span></div><input type="text" id="bookmarks.hover_color"></div>
     <div class="row"><div class="label"><span class="t">末尾显示「其他书签」文件夹</span><span class="d">show_other_bookmarks（默认一级页面直接显示书签栏）</span></div><input type="checkbox" id="bookmarks.show_other_bookmarks"></div>
-    <div class="row col"><div class="label"><span class="t">书签实时同步状态</span><span class="d">在多列书签弹窗中删除、编辑或拖拽排序后会自动同步到 Chrome 原生书签栏（点「重新读取」可刷新状态）</span></div><div class="path"><code id="bmSyncDiag">读取中...</code></div></div>
+    <div class="row col"><div class="label"><span class="t">原生书签居中弹窗状态</span><span class="d">已将 Chrome 原生书签管理器（chrome://bookmarks）改造为居中多列弹窗，直接调用 Chrome 原生接口，增删改拖实时双向同步</span></div><div class="path"><code id="bmSyncDiag">读取中...</code></div></div>
   </section>
 
   <section class="card">

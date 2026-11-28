@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cwchar>
 #include <memory>
 #include <optional>
 #include <string>
@@ -27,6 +28,7 @@
 #include "config.h"
 #include "inputhook.h"
 #include "pakpatch.h"
+#include "portable.h"
 #include "settings_server.h"
 #include "tabbookmark.h"
 #include "utils.h"
@@ -38,10 +40,12 @@ using Microsoft::WRL::ComPtr;
 constexpr wchar_t kPopupClassName[] = L"ChromePlusBookmarkPopup";
 constexpr wchar_t kDragBadgeClassName[] = L"ChromePlusBookmarkDragBadge";
 constexpr wchar_t kEditDialogClassName[] = L"ChromePlusBookmarkEditDialog";
+constexpr wchar_t kNativePopupTitleTag[] = L"\u2605 Chrome++ \u4e66\u7b7e";
 constexpr UINT kMsgFaviconReady = WM_APP + 0x41;
-constexpr UINT_PTR kHoverTimerId = 0x424D4856;      // 'BMHV'
-constexpr UINT_PTR kBatchOpenTimerId = 0x424D424F;  // 'BMBO'
-constexpr UINT_PTR kLiveSyncTimerId = 0x424D5359;   // 'BMSY'
+constexpr UINT_PTR kHoverTimerId = 0x424D4856;            // 'BMHV'
+constexpr UINT_PTR kBatchOpenTimerId = 0x424D424F;        // 'BMBO'
+constexpr UINT_PTR kNativePopupPollTimerId = 0x424D4E50;  // 'BMNP'
+constexpr UINT_PTR kNativePopupWatchTimerId = 0x424D4E57; // 'BMNW'
 constexpr UINT kHoverDelayNormalMs = 110;
 constexpr UINT kHoverDelaySafeTriangleMs = 280;
 constexpr UINT kDefaultDpi = 96;
@@ -317,88 +321,341 @@ PopupManagerState& GetManager() {
   return mgr;
 }
 
-struct LiveSyncState {
-  uint64_t last_dispatched_seq = 0;
-  ULONGLONG last_dispatch_tick = 0;
-  int retry_count = 0;
-  int ack_retry_count = 0;
+struct NativePopupState {
+  HWND popup_hwnd = nullptr;
+  HWND parent_chrome = nullptr;
+  HWND trigger_btn = nullptr;
+  bool launch_pending = false;
+  ULONGLONG launch_tick = 0;
+  int centering_ticks = 0;
+  std::wstring last_url;
 };
 
-std::atomic<uint32_t> g_live_sync_dispatched{0};
+std::atomic<uint32_t> g_native_popup_opens{0};
 
-LiveSyncState& GetLiveSyncState() {
-  static LiveSyncState s;
+NativePopupState& GetNativePopup() {
+  static NativePopupState s;
   return s;
 }
 
-void CALLBACK LiveSyncTimerProc(HWND hwnd, UINT, UINT_PTR event_id, DWORD) {
-  ::KillTimer(hwnd, event_id);
-  auto& st = GetLiveSyncState();
-  if (!hwnd || !::IsWindow(hwnd) || !IsBookmarksPakPatched()) {
+bool HasNativePopupTitle(HWND hwnd, bool* out_has_hide_tag = nullptr) {
+  wchar_t title[256] = {};
+  const int len = ::GetWindowTextW(hwnd, title, static_cast<int>(std::size(title)));
+  if (len <= 0) {
+    return false;
+  }
+  const std::wstring_view sv(title, static_cast<size_t>(len));
+  if (sv.find(kNativePopupTitleTag) == std::wstring_view::npos) {
+    return false;
+  }
+  if (out_has_hide_tag) {
+    *out_has_hide_tag = (sv.find(L"[HIDE]") != std::wstring_view::npos);
+  }
+  return true;
+}
+
+HWND FindNativeBookmarkPopupHwnd(HWND exclude_parent) {
+  struct SearchCtx {
+    DWORD pid;
+    HWND exclude;
+    HWND found;
+  } ctx{::GetCurrentProcessId(), exclude_parent, nullptr};
+
+  ::EnumWindows(
+      [](HWND hwnd, LPARAM lp) -> BOOL {
+        auto* c = reinterpret_cast<SearchCtx*>(lp);
+        if (hwnd == c->exclude || ::GetParent(hwnd) != nullptr) {
+          return TRUE;
+        }
+        DWORD pid = 0;
+        ::GetWindowThreadProcessId(hwnd, &pid);
+        if (pid != c->pid || !IsChromeWindow(hwnd)) {
+          return TRUE;
+        }
+        if (HasNativePopupTitle(hwnd)) {
+          c->found = hwnd;
+          return FALSE;
+        }
+        return TRUE;
+      },
+      reinterpret_cast<LPARAM>(&ctx));
+  return ctx.found;
+}
+
+RECT ComputeCenteredNativePopupRect(HWND chrome_root) {
+  RECT work{0, 0, ::GetSystemMetrics(SM_CXSCREEN),
+            ::GetSystemMetrics(SM_CYSCREEN)};
+  HMONITOR mon = chrome_root && ::IsWindow(chrome_root)
+                     ? ::MonitorFromWindow(chrome_root, MONITOR_DEFAULTTONEAREST)
+                     : ::MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+  MONITORINFO mi{sizeof(mi)};
+  if (mon && ::GetMonitorInfoW(mon, &mi)) {
+    work = mi.rcWork;
+  }
+
+  RECT ref = work;
+  if (chrome_root && ::IsWindow(chrome_root) && !::IsIconic(chrome_root)) {
+    RECT win_rc{};
+    if (::GetWindowRect(chrome_root, &win_rc) &&
+        win_rc.right - win_rc.left >= 200 &&
+        win_rc.bottom - win_rc.top >= 200) {
+      ref = win_rc;
+    }
+  }
+
+  const UINT dpi = GetDpiForWindowSafe(chrome_root);
+  const int work_w = static_cast<int>(work.right - work.left);
+  const int work_h = static_cast<int>(work.bottom - work.top);
+  const int ref_w = static_cast<int>(ref.right - ref.left);
+  const int ref_h = static_cast<int>(ref.bottom - ref.top);
+
+  const int col_px = ScalePx(config.GetBookmarksColumnWidth(), dpi);
+  const int desired_w = col_px * 4 + ScalePx(48, dpi);
+  const int max_w = std::max(ScalePx(560, dpi),
+                             std::min(work_w - ScalePx(36, dpi),
+                                      ScalePx(1220, dpi)));
+  const int min_w = std::min(max_w, ScalePx(760, dpi));
+  const int w = std::clamp(std::min(desired_w, (ref_w * 86) / 100), min_w, max_w);
+
+  const int desired_h = ScalePx(config.GetBookmarksMaxHeight(), dpi);
+  const int max_h = std::max(ScalePx(400, dpi), work_h - ScalePx(48, dpi));
+  const int min_h = std::min(max_h, ScalePx(480, dpi));
+  const int h = std::clamp(std::min(desired_h, (ref_h * 84) / 100), min_h, max_h);
+
+  const int margin_x = ScalePx(12, dpi);
+  const int margin_y = ScalePx(12, dpi);
+  int x = static_cast<int>(ref.left) + (ref_w - w) / 2;
+  int y = static_cast<int>(ref.top) + (ref_h - h) / 2;
+  x = std::clamp(x, static_cast<int>(work.left) + margin_x,
+                 std::max(static_cast<int>(work.left) + margin_x,
+                          static_cast<int>(work.right) - w - margin_x));
+  y = std::clamp(y, static_cast<int>(work.top) + margin_y,
+                 std::max(static_cast<int>(work.top) + margin_y,
+                          static_cast<int>(work.bottom) - h - margin_y));
+  return RECT{x, y, x + w, y + h};
+}
+
+std::wstring BuildNativeBookmarksPopupUrl() {
+  auto hex_color = [](uint32_t rgb) {
+    wchar_t buf[16] = {};
+    swprintf_s(buf, L"%%23%06X", rgb & 0xFFFFFFu);
+    return std::wstring(buf);
+  };
+  std::wstring url = L"chrome://bookmarks/#cp_popup";
+  url += L"&cw=" + std::to_wstring(config.GetBookmarksColumnWidth());
+  url += L"&ih=" + std::to_wstring(config.GetBookmarksItemHeight());
+  url += L"&fs=" + std::to_wstring(config.GetBookmarksFontSize());
+  url += L"&is=" + std::to_wstring(config.GetBookmarksIconSize());
+  url += L"&cr=" + std::to_wstring(config.GetBookmarksCornerRadius());
+  url += L"&th=" + std::to_wstring(config.GetBookmarksTheme());
+  url += L"&so=" + std::wstring(config.IsBookmarksShowOther() ? L"1" : L"0");
+  url += L"&ob=" + std::to_wstring(config.GetBookmarkNewTabMode());
+  if (config.GetBookmarksTheme() == 3) {
+    url += L"&bg=" + hex_color(config.GetBookmarksBgColor());
+    url += L"&fg=" + hex_color(config.GetBookmarksTextColor());
+    url += L"&hv=" + hex_color(config.GetBookmarksHoverColor());
+  }
+  return url;
+}
+
+void HideNativePopup(bool refocus_parent) {
+  auto& st = GetNativePopup();
+  if (st.parent_chrome && ::IsWindow(st.parent_chrome)) {
+    ::KillTimer(st.parent_chrome, kNativePopupWatchTimerId);
+    ::KillTimer(st.parent_chrome, kNativePopupPollTimerId);
+  }
+  st.launch_pending = false;
+  st.centering_ticks = 0;
+  if (st.popup_hwnd && ::IsWindow(st.popup_hwnd)) {
+    ::SetWindowPos(st.popup_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    ::ShowWindow(st.popup_hwnd, SW_HIDE);
+  }
+  if (refocus_parent && st.parent_chrome && ::IsWindow(st.parent_chrome)) {
+    ::SetForegroundWindow(st.parent_chrome);
+  }
+}
+
+void CALLBACK NativePopupWatchTimerProc(HWND hwnd,
+                                        UINT,
+                                        UINT_PTR event_id,
+                                        DWORD) {
+  auto& st = GetNativePopup();
+  if (!st.popup_hwnd || !::IsWindow(st.popup_hwnd)) {
+    st.popup_hwnd = nullptr;
+    ::KillTimer(hwnd, event_id);
+    return;
+  }
+  if (!::IsWindowVisible(st.popup_hwnd)) {
+    ::KillTimer(hwnd, event_id);
     return;
   }
 
+  // Re-center once right after initial creation in case Chrome finishes
+  // applying saved window bounds asynchronously.
+  if (st.centering_ticks > 0) {
+    --st.centering_ticks;
+    const RECT rc = ComputeCenteredNativePopupRect(st.parent_chrome);
+    ::SetWindowPos(st.popup_hwnd, HWND_TOPMOST, rc.left, rc.top,
+                   rc.right - rc.left, rc.bottom - rc.top,
+                   SWP_NOACTIVATE | SWP_SHOWWINDOW);
+  }
+
+  bool wants_hide = false;
+  if (HasNativePopupTitle(st.popup_hwnd, &wants_hide) && wants_hide) {
+    HideNativePopup(/*refocus_parent=*/true);
+    return;
+  }
+
+  // If the user switched away to another application, hide our topmost popup
+  // so it never obscures non-Chrome windows.
   HWND fg = ::GetForegroundWindow();
-  if (fg != hwnd) {
-    if (IsBookmarkPopupWindow(fg)) {
-      ::SetForegroundWindow(hwnd);
-      fg = ::GetForegroundWindow();
-    }
-    if (fg != hwnd) {
-      if (st.retry_count < 8) {
-        ++st.retry_count;
-        ::SetTimer(hwnd, kLiveSyncTimerId, 150, LiveSyncTimerProc);
-      }
+  if (fg && fg != st.popup_hwnd) {
+    DWORD fg_pid = 0;
+    ::GetWindowThreadProcessId(fg, &fg_pid);
+    if (fg_pid != 0 && fg_pid != ::GetCurrentProcessId()) {
+      HideNativePopup(/*refocus_parent=*/false);
       return;
     }
   }
+}
 
-  uint64_t max_seq = 0;
-  const std::string token =
-      IsSettingsServerReady() ? GetSettingsSessionToken() : std::string{};
-  const auto sync_url = BookmarkModel::Instance().BuildLiveSyncUrl(
-      token.empty() ? std::string_view{} : GetSettingsServerUrl(), token,
-      &max_seq);
-  if (!sync_url || max_seq == 0) {
-    st.retry_count = 0;
-    st.ack_retry_count = 0;
-    return;
-  }
+void ShowAndCenterNativePopup(HWND popup_hwnd,
+                              HWND parent_chrome,
+                              int settle_ticks) {
+  auto& st = GetNativePopup();
+  st.popup_hwnd = popup_hwnd;
+  st.parent_chrome = parent_chrome;
+  st.launch_pending = false;
+  st.centering_ticks = settle_ticks;
 
-  const ULONGLONG now = ::GetTickCount64();
-  if (max_seq <= st.last_dispatched_seq && now - st.last_dispatch_tick < 2000) {
-    return;
-  }
-  if (st.last_dispatch_tick != 0 && now - st.last_dispatch_tick < 350 &&
-      st.retry_count < 6) {
-    ++st.retry_count;
-    ::SetTimer(hwnd, kLiveSyncTimerId, 350, LiveSyncTimerProc);
-    return;
-  }
-
-  st.last_dispatched_seq = max_seq;
-  st.last_dispatch_tick = now;
-  st.retry_count = 0;
-  g_live_sync_dispatched.fetch_add(1, std::memory_order_relaxed);
-  OpenInNewTab(hwnd, *sync_url, /*background=*/true);
-
-  // If a user click cancels the brief omnibox handoff before /api/bm-ack
-  // arrives, retry gently once or twice; if already ACKed this is a no-op.
-  if (st.ack_retry_count < 2) {
-    ++st.ack_retry_count;
-    ::SetTimer(hwnd, kLiveSyncTimerId, 2500, LiveSyncTimerProc);
+  const RECT rc = ComputeCenteredNativePopupRect(parent_chrome);
+  ::ShowWindow(popup_hwnd, SW_SHOWNORMAL);
+  ::SetWindowPos(popup_hwnd, HWND_TOPMOST, rc.left, rc.top, rc.right - rc.left,
+                 rc.bottom - rc.top, SWP_SHOWWINDOW);
+  ::SetForegroundWindow(popup_hwnd);
+  if (parent_chrome && ::IsWindow(parent_chrome)) {
+    ::SetTimer(parent_chrome, kNativePopupWatchTimerId, 80,
+               NativePopupWatchTimerProc);
   }
 }
 
-void ScheduleLiveChromeSync(HWND chrome_root, UINT delay_ms = 120) {
-  if (!chrome_root || !::IsWindow(chrome_root) || !IsBookmarksPakPatched()) {
+void CALLBACK NativePopupPollTimerProc(HWND hwnd,
+                                       UINT,
+                                       UINT_PTR event_id,
+                                       DWORD) {
+  auto& st = GetNativePopup();
+  if (!st.launch_pending) {
+    ::KillTimer(hwnd, event_id);
     return;
   }
-  auto& st = GetLiveSyncState();
-  st.retry_count = 0;
-  st.ack_retry_count = 0;
-  ::SetTimer(chrome_root, kLiveSyncTimerId, delay_ms, LiveSyncTimerProc);
+  if (HWND found = FindNativeBookmarkPopupHwnd(st.parent_chrome)) {
+    ::KillTimer(hwnd, event_id);
+    ShowAndCenterNativePopup(found, st.parent_chrome, /*settle_ticks=*/2);
+    return;
+  }
+  if (::GetTickCount64() - st.launch_tick > 4500) {
+    st.launch_pending = false;
+    ::KillTimer(hwnd, event_id);
+  }
 }
+
+void LaunchNativePopupApp(HWND chrome_root, const std::wstring& url) {
+  const std::wstring exe_path = GetExePath();
+  if (exe_path.empty()) {
+    return;
+  }
+
+  const RECT rc = ComputeCenteredNativePopupRect(chrome_root);
+  const UINT dpi = GetDpiForWindowSafe(chrome_root);
+  const int dip_w = std::max(400, UnscalePx(rc.right - rc.left, dpi));
+  const int dip_h = std::max(300, UnscalePx(rc.bottom - rc.top, dpi));
+  const int dip_x = UnscalePx(rc.left, dpi);
+  const int dip_y = UnscalePx(rc.top, dpi);
+
+  std::wstring cmd = QuoteSpaceIfNeeded(exe_path);
+  cmd += L" --portable --cp-handoff";
+  LPWSTR cur_cmd = ::GetCommandLineW();
+  if (const auto udd = GetSwitchValue(cur_cmd, L"--user-data-dir");
+      udd && !udd->empty()) {
+    cmd += L" " + QuoteSpaceIfNeeded(L"--user-data-dir=" + *udd);
+  }
+  if (const auto prof = GetSwitchValue(cur_cmd, L"--profile-directory");
+      prof && !prof->empty()) {
+    cmd += L" " + QuoteSpaceIfNeeded(L"--profile-directory=" + *prof);
+  }
+  cmd += L" " + QuoteSpaceIfNeeded(L"--app=" + url);
+  cmd += L" --window-size=" + std::to_wstring(dip_w) + L"," +
+         std::to_wstring(dip_h);
+  cmd += L" --window-position=" + std::to_wstring(dip_x) + L"," +
+         std::to_wstring(dip_y);
+
+  std::vector<wchar_t> cmd_buf(cmd.begin(), cmd.end());
+  cmd_buf.push_back(L'\0');
+
+  STARTUPINFOW si{};
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESHOWWINDOW;
+  si.wShowWindow = SW_SHOWNORMAL;
+  PROCESS_INFORMATION pi{};
+  if (::CreateProcessW(exe_path.c_str(), cmd_buf.data(), nullptr, nullptr,
+                       FALSE, 0, nullptr, GetAppDir().c_str(), &si, &pi)) {
+    ::CloseHandle(pi.hThread);
+    ::CloseHandle(pi.hProcess);
+  }
+}
+
+void ToggleNativeBookmarkPopup(HWND chrome_root, HWND trigger_btn_hwnd) {
+  auto& st = GetNativePopup();
+  if (chrome_root &&
+      (chrome_root == st.popup_hwnd || HasNativePopupTitle(chrome_root))) {
+    if (!st.popup_hwnd) {
+      st.popup_hwnd = chrome_root;
+    }
+    HideNativePopup(/*refocus_parent=*/true);
+    return;
+  }
+  st.parent_chrome = chrome_root;
+  st.trigger_btn = trigger_btn_hwnd;
+
+  if (st.popup_hwnd && !::IsWindow(st.popup_hwnd)) {
+    st.popup_hwnd = nullptr;
+  }
+  if (!st.popup_hwnd) {
+    st.popup_hwnd = FindNativeBookmarkPopupHwnd(chrome_root);
+  }
+
+  const std::wstring url = BuildNativeBookmarksPopupUrl();
+  if (st.popup_hwnd && ::IsWindow(st.popup_hwnd)) {
+    if (::IsWindowVisible(st.popup_hwnd)) {
+      HideNativePopup(/*refocus_parent=*/true);
+      return;
+    }
+    if (st.last_url == url) {
+      g_native_popup_opens.fetch_add(1, std::memory_order_relaxed);
+      ShowAndCenterNativePopup(st.popup_hwnd, chrome_root, /*settle_ticks=*/0);
+      return;
+    }
+    // Config changed while hidden: recreate so fresh styles take effect.
+    ::PostMessageW(st.popup_hwnd, WM_CLOSE, 0, 0);
+    st.popup_hwnd = nullptr;
+  }
+
+  if (st.launch_pending && ::GetTickCount64() - st.launch_tick < 1200) {
+    return;
+  }
+  st.last_url = url;
+  st.launch_pending = true;
+  st.launch_tick = ::GetTickCount64();
+  g_native_popup_opens.fetch_add(1, std::memory_order_relaxed);
+  LaunchNativePopupApp(chrome_root, url);
+  if (chrome_root && ::IsWindow(chrome_root)) {
+    ::SetTimer(chrome_root, kNativePopupPollTimerId, 60,
+               NativePopupPollTimerProc);
+  }
+}
+
+void ScheduleLiveChromeSync(HWND, UINT = 120) {}
 
 void ClosePopupsFromLevel(int from_level);
 void OpenChildPopup(PopupWindow* parent, int item_index);
@@ -2409,10 +2666,30 @@ void OpenChildPopup(PopupWindow* parent, int item_index) {
 }
 
 bool PopupMouseHook(WPARAM wParam, LPARAM lParam) {
-  if (!IsBookmarkPopupOpen()) {
+  const bool is_down =
+      (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN ||
+       wParam == WM_MBUTTONDOWN || wParam == WM_NCLBUTTONDOWN ||
+       wParam == WM_NCRBUTTONDOWN || wParam == WM_NCMBUTTONDOWN);
+
+  auto& nst = GetNativePopup();
+  if (nst.popup_hwnd && ::IsWindow(nst.popup_hwnd) &&
+      ::IsWindowVisible(nst.popup_hwnd)) {
+    if (is_down) {
+      const auto* pmouse = reinterpret_cast<const MOUSEHOOKSTRUCT*>(lParam);
+      HWND target = ::WindowFromPoint(pmouse->pt);
+      HWND target_root = target ? ::GetAncestor(target, GA_ROOT) : nullptr;
+      if (target != nst.trigger_btn && target != nst.popup_hwnd &&
+          target_root != nst.popup_hwnd) {
+        HideNativePopup(/*refocus_parent=*/false);
+      }
+    }
     return false;
   }
+
   auto& mgr = GetManager();
+  if (mgr.stack.empty()) {
+    return false;
+  }
   if (mgr.modal_ui_active) {
     return false;
   }
@@ -2423,9 +2700,7 @@ bool PopupMouseHook(WPARAM wParam, LPARAM lParam) {
     }
     return false;
   }
-  if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN ||
-      wParam == WM_MBUTTONDOWN || wParam == WM_NCLBUTTONDOWN ||
-      wParam == WM_NCRBUTTONDOWN || wParam == WM_NCMBUTTONDOWN) {
+  if (is_down) {
     const auto* pmouse = reinterpret_cast<const MOUSEHOOKSTRUCT*>(lParam);
     HWND target = ::WindowFromPoint(pmouse->pt);
     if (target == mgr.trigger_btn || IsBookmarkPopupWindow(target)) {
@@ -2437,7 +2712,8 @@ bool PopupMouseHook(WPARAM wParam, LPARAM lParam) {
 }
 
 bool PopupKeyboardHook(WPARAM wParam, LPARAM lParam) {
-  if (!IsBookmarkPopupOpen() || (lParam & 0x80000000)) {
+  auto& mgr = GetManager();
+  if (mgr.stack.empty() || (lParam & 0x80000000)) {
     return false;
   }
   // Ignore synthetic SendInput keys (scan_code == 0), e.g. from OpenInNewTab.
@@ -2446,7 +2722,6 @@ bool PopupKeyboardHook(WPARAM wParam, LPARAM lParam) {
     return false;
   }
 
-  auto& mgr = GetManager();
   if (mgr.modal_ui_active) {
     return false;
   }
@@ -2528,6 +2803,21 @@ bool PopupKeyboardHook(WPARAM wParam, LPARAM lParam) {
   return false;
 }
 
+void CloseWin32BookmarkPopups() {
+  CancelItemDrag();
+  auto& mgr = GetManager();
+  mgr.modal_ui_active = false;
+  mgr.batch_open_urls.clear();
+  if (mgr.drag.badge_hwnd && ::IsWindow(mgr.drag.badge_hwnd)) {
+    ::DestroyWindow(mgr.drag.badge_hwnd);
+    mgr.drag.badge_hwnd = nullptr;
+  }
+  ClosePopupsFromLevel(0);
+  mgr.chrome_root = nullptr;
+  mgr.trigger_btn = nullptr;
+  mgr.root_snapshot.reset();
+}
+
 }  // namespace
 
 void InitBookmarkPopup() {
@@ -2543,13 +2833,19 @@ void InitBookmarkPopup() {
 void ToggleBookmarkPopup(HWND chrome_root,
                          POINT anchor_screen_pt,
                          HWND trigger_btn_hwnd) {
-  auto& mgr = GetManager();
-  if (IsBookmarkPopupOpen() && mgr.chrome_root == chrome_root) {
-    CloseAllBookmarkPopups();
+  if (IsBookmarksPakPatched()) {
+    CloseWin32BookmarkPopups();
+    ToggleNativeBookmarkPopup(chrome_root, trigger_btn_hwnd);
     return;
   }
 
-  CloseAllBookmarkPopups();
+  auto& mgr = GetManager();
+  if (!mgr.stack.empty() && mgr.chrome_root == chrome_root) {
+    CloseWin32BookmarkPopups();
+    return;
+  }
+
+  CloseWin32BookmarkPopups();
 
   BookmarkModel::Instance().EnsureLoaded(config.IsBookmarksShowOther());
   mgr.chrome_root = chrome_root;
@@ -2566,30 +2862,31 @@ void ToggleBookmarkPopup(HWND chrome_root,
       0, -1, L"__bookmark_bar__", L"", root_src, mgr.root_snapshot,
       anchor_screen_pt, false, RECT{});
   if (root_popup) {
+    // Center the fallback Win32 popup on the Chrome window as well.
+    const RECT center_rc = ComputeCenteredNativePopupRect(chrome_root);
+    const int cx = (center_rc.left + center_rc.right - root_popup->width) / 2;
+    const int cy = (center_rc.top + center_rc.bottom - root_popup->height) / 2;
+    ::SetWindowPos(root_popup->hwnd, nullptr, cx, cy, 0, 0,
+                   SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+
     const HWND notify_hwnd = root_popup->hwnd;
     mgr.stack.push_back(std::move(root_popup));
     BookmarkModel::Instance().RequestFaviconsAsync(notify_hwnd,
                                                    kMsgFaviconReady);
-    ScheduleLiveChromeSync(chrome_root, 350);
   }
 }
 
 void CloseAllBookmarkPopups() {
-  CancelItemDrag();
-  auto& mgr = GetManager();
-  mgr.modal_ui_active = false;
-  mgr.batch_open_urls.clear();
-  if (mgr.drag.badge_hwnd && ::IsWindow(mgr.drag.badge_hwnd)) {
-    ::DestroyWindow(mgr.drag.badge_hwnd);
-    mgr.drag.badge_hwnd = nullptr;
-  }
-  ClosePopupsFromLevel(0);
-  mgr.chrome_root = nullptr;
-  mgr.trigger_btn = nullptr;
-  mgr.root_snapshot.reset();
+  HideNativePopup(/*refocus_parent=*/false);
+  CloseWin32BookmarkPopups();
 }
 
 bool IsBookmarkPopupOpen() {
+  const auto& nst = GetNativePopup();
+  if (nst.popup_hwnd && ::IsWindow(nst.popup_hwnd) &&
+      ::IsWindowVisible(nst.popup_hwnd)) {
+    return true;
+  }
   return !GetManager().stack.empty();
 }
 
@@ -2597,7 +2894,41 @@ bool IsBookmarkPopupWindow(HWND hwnd) {
   return hwnd && FindPopupByHwnd(hwnd) != nullptr;
 }
 
+bool IsNativeBookmarkPopupWindow(HWND hwnd) {
+  if (!hwnd) {
+    return false;
+  }
+  if (hwnd == GetNativePopup().popup_hwnd) {
+    return true;
+  }
+  return HasNativePopupTitle(hwnd);
+}
+
+void CloseOrphanNativeBookmarkPopup() {
+  auto& st = GetNativePopup();
+  if (st.popup_hwnd && ::IsWindow(st.popup_hwnd)) {
+    ::PostMessageW(st.popup_hwnd, WM_CLOSE, 0, 0);
+    st.popup_hwnd = nullptr;
+  }
+  st.launch_pending = false;
+}
+
 void RefreshOpenBookmarkPopups() {
+  auto& nst = GetNativePopup();
+  if (nst.popup_hwnd && ::IsWindow(nst.popup_hwnd)) {
+    const std::wstring new_url = BuildNativeBookmarksPopupUrl();
+    if (nst.last_url != new_url) {
+      const bool was_visible = ::IsWindowVisible(nst.popup_hwnd) != FALSE;
+      HWND parent = nst.parent_chrome;
+      HWND trigger = nst.trigger_btn;
+      ::PostMessageW(nst.popup_hwnd, WM_CLOSE, 0, 0);
+      nst.popup_hwnd = nullptr;
+      if (was_visible && parent && ::IsWindow(parent)) {
+        ToggleNativeBookmarkPopup(parent, trigger);
+      }
+    }
+  }
+
   auto& mgr = GetManager();
   if (mgr.stack.empty()) {
     return;
@@ -2610,5 +2941,5 @@ void RefreshOpenBookmarkPopups() {
 }
 
 uint32_t GetLiveSyncDispatchCount() {
-  return g_live_sync_dispatched.load(std::memory_order_relaxed);
+  return g_native_popup_opens.load(std::memory_order_relaxed);
 }
