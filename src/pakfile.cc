@@ -232,17 +232,25 @@ bool PatchGzipEntry(std::span<uint8_t> entry, const PatchCallback& f) {
 bool WriteZstdEntry(std::span<const uint8_t> content,
                     std::span<uint8_t> entry) {
   auto encoded = std::make_unique_for_overwrite<uint8_t[]>(entry.size());
-  const size_t frame_size = ZSTD_compress(
-      encoded.get(), entry.size(), content.data(), content.size(), kZstdLevel);
-  if (ZSTD_isError(frame_size)) {
+  size_t frame_size = 0;
+  bool fit = false;
+  for (const int level : {kZstdLevel, 19}) {
+    frame_size = ZSTD_compress(encoded.get(), entry.size(), content.data(),
+                               content.size(), level);
+    if (!ZSTD_isError(frame_size)) {
+      const size_t pad = entry.size() - frame_size;
+      if (pad == 0 || pad >= ZSTD_SKIPPABLEHEADERSIZE) {
+        fit = true;
+        break;
+      }
+    }
+  }
+  if (!fit) {
     return false;
   }
 
   const size_t padding = entry.size() - frame_size;
   if (padding != 0) {
-    if (padding < ZSTD_SKIPPABLEHEADERSIZE) {
-      return false;
-    }
     // Little-endian, as zstd requires and every Windows target is.
     const uint32_t header[] = {
         ZSTD_MAGIC_SKIPPABLE_START,
@@ -301,6 +309,39 @@ bool PatchZstdEntry(std::span<uint8_t> entry, const PatchCallback& f) {
   return true;
 }
 
+bool LooksLikeTextEntry(std::span<const uint8_t> entry) {
+  if (entry.empty()) {
+    return false;
+  }
+  const size_t check = std::min<size_t>(entry.size(), 64);
+  for (size_t i = 0; i < check; ++i) {
+    const uint8_t b = entry[i];
+    if (b == 0 || (b < 0x09) || (b >= 0x0E && b < 0x20)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool PatchRawEntry(std::span<uint8_t> entry, const PatchCallback& f) {
+  if (entry.empty() || entry.size() > kMaxContentSize ||
+      !LooksLikeTextEntry(entry)) {
+    return false;
+  }
+  auto copy = std::make_unique_for_overwrite<uint8_t[]>(entry.size());
+  memcpy(copy.get(), entry.data(), entry.size());
+  size_t new_len = entry.size();
+  if (!f(copy.get(), static_cast<uint32_t>(entry.size()), new_len) ||
+      new_len > entry.size()) {
+    return false;
+  }
+  memcpy(entry.data(), copy.get(), new_len);
+  if (new_len < entry.size()) {
+    memset(entry.data() + new_len, ' ', entry.size() - new_len);
+  }
+  return true;
+}
+
 }  // namespace
 
 uint16_t PatchPakResource(uint8_t* buffer,
@@ -330,6 +371,8 @@ uint16_t PatchPakResource(uint8_t* buffer,
           claimed = PatchGzipEntry(entry, f);
         } else if (StartsWith(entry, kZstdMagic)) {
           claimed = PatchZstdEntry(entry, f);
+        } else {
+          claimed = PatchRawEntry(entry, f);
         }
         // Only one resource is the patch target; once the callback has handled
         // it there is nothing left to find, so stop scanning the rest of the

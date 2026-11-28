@@ -22,7 +22,9 @@
 
 #include "bookmark_button.h"
 #include "bookmark_model.h"
+#include "bookmark_popup.h"
 #include "config.h"
+#include "pakpatch.h"
 #include "utils.h"
 #include "version.h"
 
@@ -33,6 +35,8 @@ constexpr std::string_view kExpectedHost = "127.0.0.1:19876";
 
 std::string g_session_token;
 std::atomic<bool> g_server_ready{false};
+std::atomic<uint32_t> g_bm_ack_count{0};
+std::atomic<uint32_t> g_bm_last_ack_ok{0};
 
 std::string WideToUtf8(std::wstring_view wide) {
   if (wide.empty()) {
@@ -291,6 +295,10 @@ std::string BuildConfigJson() {
                   first);
   AppendJsonField(json, "button_anchor",
                   GetIniInt(L"bookmarks", L"button_anchor", 0), first);
+  AppendJsonField(json, "button_offset_x",
+                  GetIniInt(L"bookmarks", L"button_offset_x", 0), first);
+  AppendJsonField(json, "button_offset_y",
+                  GetIniInt(L"bookmarks", L"button_offset_y", 0), first);
   AppendJsonField(json, "button_size",
                   GetIniInt(L"bookmarks", L"button_size", 28), first);
   AppendJsonField(json, "column_width",
@@ -326,6 +334,13 @@ std::string BuildConfigJson() {
   AppendJsonField(json, "show_other_bookmarks",
                   GetIniInt(L"bookmarks", L"show_other_bookmarks", 1) != 0,
                   first);
+  const std::string sync_diag =
+      "pak=" + GetBookmarksPakDiagnostic() + " | pending=" +
+      std::to_string(BookmarkModel::Instance().GetPendingSyncOpCount()) +
+      " | sent=" + std::to_string(GetLiveSyncDispatchCount()) + " | ack=" +
+      std::to_string(g_bm_ack_count.load(std::memory_order_relaxed)) + " (ok=" +
+      std::to_string(g_bm_last_ack_ok.load(std::memory_order_relaxed)) + ")";
+  AppendJsonField(json, "sync_diag", sync_diag, first);
   json += "}}";
   return json;
 }
@@ -539,7 +554,11 @@ constexpr AllowedIniKey kAllowedKeys[] = {
     // bookmarks
     {"bookmarks.enabled", L"bookmarks", L"enabled", true, 0, 1},
     {"bookmarks.hotkey", L"bookmarks", L"hotkey"},
-    {"bookmarks.button_anchor", L"bookmarks", L"button_anchor", true, 0, 2},
+    {"bookmarks.button_anchor", L"bookmarks", L"button_anchor", true, 0, 3},
+    {"bookmarks.button_offset_x", L"bookmarks", L"button_offset_x", true, -4000,
+     4000},
+    {"bookmarks.button_offset_y", L"bookmarks", L"button_offset_y", true, -2000,
+     2000},
     {"bookmarks.button_size", L"bookmarks", L"button_size", true, 18, 48},
     {"bookmarks.column_width", L"bookmarks", L"column_width", true, 150, 600},
     {"bookmarks.max_height", L"bookmarks", L"max_height", true, 200, 2000},
@@ -712,8 +731,17 @@ input[type=checkbox]{width:18px;height:18px;accent-color:var(--accent);cursor:po
       std::string(R"HTML(
   <section class="card">
     <div class="card-title">多列书签弹窗 [bookmarks] <span class="sub">保存后立即热生效（快捷键需重启）</span></div>
-    <div class="row"><div class="label"><span class="t">启用左上角收藏夹按钮与多列弹窗</span><span class="d">enabled（可按住 Alt+左键直接拖动按钮微调位置）</span></div><input type="checkbox" id="bookmarks.enabled"></div>
-    <div class="row"><div class="label"><span class="t">按钮位置锚点</span><span class="d">button_anchor</span></div><select id="bookmarks.button_anchor"><option value="0">地址栏左侧</option><option value="1">工具栏最左侧</option><option value="2">标签栏左上角</option></select></div>
+    <div class="row"><div class="label"><span class="t">启用收藏夹按钮与多列弹窗</span><span class="d">enabled（可按住 Alt+左键直接拖动按钮到任意位置）</span></div><input type="checkbox" id="bookmarks.enabled"></div>
+    <div class="row col">
+      <div class="label"><span class="t">按钮位置锚点</span><span class="d">button_anchor（切换到新锚点后建议点下方「重置偏移 (0, 0)」）</span></div>
+      <select id="bookmarks.button_anchor"><option value="0">地址栏左侧</option><option value="1">工具栏最左侧</option><option value="2">标签栏左上角</option><option value="3">地址栏右侧（星标旁）</option></select>
+      <div class="presets">
+        <button type="button" class="preset" data-bmoffset="right">一键移到地址栏右侧（星标旁）</button>
+        <button type="button" class="preset" data-bmoffset="reset">重置偏移 (0, 0)</button>
+      </div>
+    </div>
+    <div class="row"><div class="label"><span class="t">按钮水平偏移（像素）</span><span class="d">button_offset_x（-4000 ~ 4000，正值向右，也可按住 Alt+左键直接拖动）</span></div><input type="number" id="bookmarks.button_offset_x" min="-4000" max="4000"></div>
+    <div class="row"><div class="label"><span class="t">按钮垂直偏移（像素）</span><span class="d">button_offset_y（-2000 ~ 2000，正值向下）</span></div><input type="number" id="bookmarks.button_offset_y" min="-2000" max="2000"></div>
     <div class="row"><div class="label"><span class="t">触发快捷键 (hotkey)</span><span class="d">可选，例如 Alt+A（留空则仅点击按钮触发）</span></div><input type="text" id="bookmarks.hotkey" placeholder="例如 Alt+A"></div>
     <div class="row"><div class="label"><span class="t">按钮尺寸（像素）</span><span class="d">button_size（18 - 48）</span></div><input type="number" id="bookmarks.button_size" min="18" max="48"></div>
     <div class="row"><div class="label"><span class="t">单列宽度（像素）</span><span class="d">column_width（150 - 600，也可直接拖拽弹窗右边缘调整）</span></div><input type="number" id="bookmarks.column_width" min="150" max="600" step="10"></div>
@@ -736,6 +764,7 @@ input[type=checkbox]{width:18px;height:18px;accent-color:var(--accent);cursor:po
     <div class="row"><div class="label"><span class="t">自定义文字色 (text_color)</span><span class="d">theme=3 时生效，十六进制如 #202124</span></div><input type="text" id="bookmarks.text_color"></div>
     <div class="row"><div class="label"><span class="t">自定义悬停高亮色 (hover_color)</span><span class="d">theme=3 时生效，十六进制如 #E8F0FE</span></div><input type="text" id="bookmarks.hover_color"></div>
     <div class="row"><div class="label"><span class="t">末尾显示「其他书签」文件夹</span><span class="d">show_other_bookmarks（默认一级页面直接显示书签栏）</span></div><input type="checkbox" id="bookmarks.show_other_bookmarks"></div>
+    <div class="row col"><div class="label"><span class="t">书签实时同步状态</span><span class="d">在多列书签弹窗中删除、编辑或拖拽排序后会自动同步到 Chrome 原生书签栏（点「重新读取」可刷新状态）</span></div><div class="path"><code id="bmSyncDiag">读取中...</code></div></div>
   </section>
 
   <section class="card">
@@ -781,7 +810,8 @@ const fields = [
   'tabs.keep_last_tab','tabs.wheel_tab','tabs.wheel_tab_when_press_rbutton',
   'tabs.hover_tab','tabs.hover_tab_delay','tabs.open_url_new_tab',
   'tabs.open_bookmark_new_tab','tabs.super_drag','tabs.new_tab_disable','tabs.new_tab_disable_name',
-  'bookmarks.enabled','bookmarks.button_anchor','bookmarks.hotkey','bookmarks.button_size',
+  'bookmarks.enabled','bookmarks.button_anchor','bookmarks.button_offset_x','bookmarks.button_offset_y',
+  'bookmarks.hotkey','bookmarks.button_size',
   'bookmarks.column_width','bookmarks.max_height','bookmarks.item_height','bookmarks.font_size',
   'bookmarks.font_family','bookmarks.icon_size','bookmarks.corner_radius','bookmarks.theme',
   'bookmarks.bg_color','bookmarks.text_color','bookmarks.hover_color','bookmarks.show_other_bookmarks',
@@ -800,6 +830,7 @@ async function loadConfig() {
     const data = await res.json();
     $('ver').textContent = 'v' + (data.version || '');
     $('iniPath').textContent = data.ini_path || 'chrome++.ini';
+    if ($('bmSyncDiag')) $('bmSyncDiag').textContent = data.bookmarks?.sync_diag || '';
     for (const f of fields) {
       const [sec, key] = f.split('.');
       const val = data[sec]?.[key];
@@ -842,6 +873,13 @@ document.querySelectorAll('.preset').forEach(btn => {
       $('proxy.enabled').checked = true;
     } else if (btn.dataset.scale !== undefined) {
       $('general.ui_scale').value = btn.dataset.scale;
+    } else if (btn.dataset.bmoffset === 'right') {
+      $('bookmarks.button_anchor').value = '3';
+      $('bookmarks.button_offset_x').value = '0';
+      $('bookmarks.button_offset_y').value = '0';
+    } else if (btn.dataset.bmoffset === 'reset') {
+      $('bookmarks.button_offset_x').value = '0';
+      $('bookmarks.button_offset_y').value = '0';
     } else if (btn.dataset.bm === 'classic') {
       $('bookmarks.theme').value = '1';
       $('bookmarks.column_width').value = '230';
@@ -1069,6 +1107,14 @@ void HandleClient(SOCKET client) {
       SendHttpResponse(client, "403 Forbidden", "text/plain; charset=utf-8",
                        "Forbidden");
     } else {
+      const std::string ok_str = get_query_param("ok");
+      uint32_t ok_val = 0;
+      if (!ok_str.empty()) {
+        std::from_chars(ok_str.data(), ok_str.data() + ok_str.size(), ok_val);
+      }
+      g_bm_ack_count.fetch_add(1, std::memory_order_relaxed);
+      g_bm_last_ack_ok.store(ok_val, std::memory_order_relaxed);
+
       const std::string seq_str = get_query_param("seq");
       uint64_t seq = 0;
       const auto [ptr, ec] = std::from_chars(

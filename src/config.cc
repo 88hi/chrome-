@@ -135,13 +135,13 @@ void Config::ReloadBookmarksConfig() {
   bookmarks_enabled_.store(GetIniInt(L"bookmarks", L"enabled", 1) != 0,
                            std::memory_order_relaxed);
   bookmarks_button_anchor_.store(
-      std::clamp(GetIniInt(L"bookmarks", L"button_anchor", 0), 0, 2),
+      std::clamp(GetIniInt(L"bookmarks", L"button_anchor", 0), 0, 3),
       std::memory_order_relaxed);
   bookmarks_button_offset_x_.store(
-      std::clamp(GetIniInt(L"bookmarks", L"button_offset_x", 0), -1000, 1000),
+      std::clamp(GetIniInt(L"bookmarks", L"button_offset_x", 0), -4000, 4000),
       std::memory_order_relaxed);
   bookmarks_button_offset_y_.store(
-      std::clamp(GetIniInt(L"bookmarks", L"button_offset_y", 0), -500, 500),
+      std::clamp(GetIniInt(L"bookmarks", L"button_offset_y", 0), -2000, 2000),
       std::memory_order_relaxed);
   bookmarks_button_size_.store(
       std::clamp(GetIniInt(L"bookmarks", L"button_size", 28), 18, 48),
@@ -216,8 +216,8 @@ void Config::UpdateBookmarkPopupSize(int column_width, int max_height) {
 }
 
 void Config::UpdateBookmarkButtonOffset(int offset_x, int offset_y) {
-  offset_x = std::clamp(offset_x, -1000, 1000);
-  offset_y = std::clamp(offset_y, -500, 500);
+  offset_x = std::clamp(offset_x, -4000, 4000);
+  offset_y = std::clamp(offset_y, -2000, 2000);
   bookmarks_button_offset_x_.store(offset_x, std::memory_order_relaxed);
   bookmarks_button_offset_y_.store(offset_y, std::memory_order_relaxed);
 

@@ -274,6 +274,9 @@ void UpdateButtonPosition(ButtonEntry* entry) {
   } else if (anchor_mode == 1) {
     x = anchor->rect.left + ScalePx(4, entry->dpi) + off_x;
     y = (anchor->rect.top + anchor->rect.bottom - new_sz) / 2 + off_y;
+  } else if (anchor_mode == 3) {
+    x = anchor->rect.right - new_sz - ScalePx(36, entry->dpi) + off_x;
+    y = (anchor->rect.top + anchor->rect.bottom - new_sz) / 2 + off_y;
   } else {
     x = anchor->rect.left + ScalePx(6, entry->dpi) + off_x;
     y = anchor->rect.top + ScalePx(4, entry->dpi) + off_y;

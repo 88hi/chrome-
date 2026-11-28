@@ -1450,7 +1450,7 @@ std::optional<BookmarkAnchorRect> FindBookmarkButtonAnchor(HWND hwnd,
   }
 
   ComPtr<IUIAutomationElement> target;
-  if (anchor_mode == 0) {
+  if (anchor_mode == 0 || anchor_mode == 3) {
     target = FindShallowDescendantByClasses(
         session->control_view_walker.Get(), top_container,
         {L"LocationBarView"}, /*max_visited=*/128);

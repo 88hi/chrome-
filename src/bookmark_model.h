@@ -91,8 +91,8 @@ class BookmarkModel {
                       const std::wstring& node_guid,
                       bool show_other_bookmarks);
 
-  // Builds a `chrome://bookmarks/#cp_sync=<base64url>` URL carrying all
-  // unsynced ops so patched `chrome://bookmarks` applies them to Chrome's live
+  // Builds a `chrome://bookmarks/#cp=<base64url>` URL carrying all unsynced
+  // ops so patched `chrome://bookmarks` applies them to Chrome's live
   // BookmarkModel and native bookmark bar immediately.
   std::optional<std::wstring> BuildLiveSyncUrl(std::string_view base_url,
                                                std::string_view token,
@@ -103,6 +103,9 @@ class BookmarkModel {
   void MarkOpsSynced(
       uint64_t up_to_seq,
       const std::vector<std::pair<std::string, std::string>>& id_map);
+
+  // Returns the number of unsynced operations currently queued in the journal.
+  size_t GetPendingSyncOpCount() const;
 
   // Re-applies unsynced Chrome++ bookmark edits onto Chrome's on-disk
   // Bookmarks/AccountBookmarks files on browser exit as fallback.

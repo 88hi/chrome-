@@ -12,6 +12,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -320,7 +321,10 @@ struct LiveSyncState {
   uint64_t last_dispatched_seq = 0;
   ULONGLONG last_dispatch_tick = 0;
   int retry_count = 0;
+  int ack_retry_count = 0;
 };
+
+std::atomic<uint32_t> g_live_sync_dispatched{0};
 
 LiveSyncState& GetLiveSyncState() {
   static LiveSyncState s;
@@ -357,6 +361,7 @@ void CALLBACK LiveSyncTimerProc(HWND hwnd, UINT, UINT_PTR event_id, DWORD) {
       &max_seq);
   if (!sync_url || max_seq == 0) {
     st.retry_count = 0;
+    st.ack_retry_count = 0;
     return;
   }
 
@@ -374,7 +379,15 @@ void CALLBACK LiveSyncTimerProc(HWND hwnd, UINT, UINT_PTR event_id, DWORD) {
   st.last_dispatched_seq = max_seq;
   st.last_dispatch_tick = now;
   st.retry_count = 0;
+  g_live_sync_dispatched.fetch_add(1, std::memory_order_relaxed);
   OpenInNewTab(hwnd, *sync_url, /*background=*/true);
+
+  // If a user click cancels the brief omnibox handoff before /api/bm-ack
+  // arrives, retry gently once or twice; if already ACKed this is a no-op.
+  if (st.ack_retry_count < 2) {
+    ++st.ack_retry_count;
+    ::SetTimer(hwnd, kLiveSyncTimerId, 2500, LiveSyncTimerProc);
+  }
 }
 
 void ScheduleLiveChromeSync(HWND chrome_root, UINT delay_ms = 120) {
@@ -383,6 +396,7 @@ void ScheduleLiveChromeSync(HWND chrome_root, UINT delay_ms = 120) {
   }
   auto& st = GetLiveSyncState();
   st.retry_count = 0;
+  st.ack_retry_count = 0;
   ::SetTimer(chrome_root, kLiveSyncTimerId, delay_ms, LiveSyncTimerProc);
 }
 
@@ -2593,4 +2607,8 @@ void RefreshOpenBookmarkPopups() {
     RelayoutAndResizePopup(win.get(), true);
     ::InvalidateRect(win->hwnd, nullptr, FALSE);
   }
+}
+
+uint32_t GetLiveSyncDispatchCount() {
+  return g_live_sync_dispatched.load(std::memory_order_relaxed);
 }

@@ -2773,7 +2773,7 @@ std::optional<std::wstring> BookmarkModel::BuildLiveSyncUrl(
     ack += token;
     ack += "&seq=";
     ack += std::to_string(max_seq);
-    payload.SetString("ack", ack);
+    payload.SetString("a", ack);
   }
 
   JsonValue ops_arr;
@@ -2823,13 +2823,13 @@ std::optional<std::wstring> BookmarkModel::BuildLiveSyncUrl(
     }
     ops_arr.arr_val.push_back(std::move(o));
   }
-  payload.obj_val.emplace_back("ops", std::move(ops_arr));
+  payload.obj_val.emplace_back("o", std::move(ops_arr));
 
   std::string json;
   json.reserve(1024);
   SerializeJsonValue(json, payload, 0);
   const std::string encoded = Base64UrlEncode(json);
-  return L"chrome://bookmarks/#cp_sync=" + Utf8ToWide(encoded);
+  return L"chrome://bookmarks/#cp=" + Utf8ToWide(encoded);
 }
 
 void BookmarkModel::MarkOpsSynced(
@@ -2894,6 +2894,33 @@ void BookmarkModel::MarkOpsSynced(
   if (changed) {
     SaveJournalToDisk(profile_dir, ops);
   }
+}
+
+size_t BookmarkModel::GetPendingSyncOpCount() const {
+  std::wstring profile_dir;
+  {
+    auto& store = GetStore();
+    std::lock_guard lock(store.mutex);
+    profile_dir = store.profile_dir;
+  }
+  if (profile_dir.empty()) {
+    if (auto detected = FindBestActiveProfileDir(nullptr)) {
+      profile_dir = *detected;
+    } else {
+      return 0;
+    }
+  }
+
+  auto& store = GetStore();
+  std::lock_guard jlock(store.journal_mutex);
+  const auto ops = LoadJournalFromDisk(profile_dir);
+  size_t count = 0;
+  for (const auto& op : ops) {
+    if (!op.synced) {
+      ++count;
+    }
+  }
+  return count;
 }
 
 void BookmarkModel::FlushPendingOpsToChromeFiles() {

@@ -6,10 +6,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
 #include <iterator>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -36,6 +38,13 @@ namespace {
 
 HANDLE resources_pak_map = nullptr;
 std::atomic<bool> g_bookmarks_pak_patched{false};
+std::atomic<uint32_t> g_bm_cand_orig{0};
+std::atomic<uint32_t> g_bm_cand_compacted{0};
+std::atomic<uint32_t> g_bm_cand_new{0};
+std::atomic<uint32_t> g_bm_cand_hits{0};
+std::atomic<bool> g_bm_from_cache{false};
+std::mutex g_bm_diag_mutex;
+std::string g_bm_pak_diag = "uninit";
 
 auto RawCreateFileMapping = CreateFileMappingW;
 auto RawMapViewOfFile = MapViewOfFile;
@@ -247,151 +256,419 @@ bool PatchSettingsHtml(uint8_t* begin, uint32_t size, size_t& new_len) {
   return true;
 }
 
-void CompactJsForPakPatch(std::string& js) {
+std::string CompactTemplateSegment(std::string_view seg, bool is_css) {
+  std::string cleaned;
+  cleaned.reserve(seg.size());
+  for (size_t i = 0; i < seg.size();) {
+    if (is_css && i + 1 < seg.size() && seg[i] == '/' && seg[i + 1] == '*') {
+      const size_t end = seg.find("*/", i + 2);
+      if (end != std::string_view::npos) {
+        i = end + 2;
+        continue;
+      }
+    }
+    if (!is_css && i + 3 < seg.size() && seg[i] == '<' && seg[i + 1] == '!' &&
+        seg[i + 2] == '-' && seg[i + 3] == '-') {
+      const size_t end = seg.find("-->", i + 4);
+      if (end != std::string_view::npos) {
+        i = end + 3;
+        continue;
+      }
+    }
+    cleaned.push_back(seg[i++]);
+  }
+
   std::string out;
-  out.reserve(js.size());
+  out.reserve(cleaned.size());
   size_t i = 0;
-  const size_t n = js.size();
-  bool in_license_block = false;
+  const size_t n = cleaned.size();
   while (i < n) {
-    size_t eol = js.find('\n', i);
+    size_t eol = cleaned.find('\n', i);
     if (eol == std::string::npos) {
       eol = n;
     }
     size_t s = i;
     size_t e = eol;
-    while (s < e && (js[s] == ' ' || js[s] == '\t' || js[s] == '\r')) {
+    while (s < e &&
+           (cleaned[s] == ' ' || cleaned[s] == '\t' || cleaned[s] == '\r')) {
       ++s;
     }
-    while (e > s && (js[e - 1] == ' ' || js[e - 1] == '\t' || js[e - 1] == '\r')) {
+    while (e > s && (cleaned[e - 1] == ' ' || cleaned[e - 1] == '\t' ||
+                     cleaned[e - 1] == '\r')) {
       --e;
     }
-    std::string_view line(js.data() + s, e - s);
-    if (in_license_block) {
-      const size_t end_c = line.find("*/");
-      if (end_c != std::string_view::npos) {
-        in_license_block = false;
-        line = line.substr(end_c + 2);
-        while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) {
-          line.remove_prefix(1);
-        }
-        if (line.empty()) {
-          i = (eol < n) ? (eol + 1) : n;
-          continue;
-        }
-      } else {
-        i = (eol < n) ? (eol + 1) : n;
-        continue;
-      }
-    }
-    if (line.starts_with("/*") && line.find("Copyright") != std::string_view::npos) {
-      const size_t end_c = line.find("*/");
-      if (end_c == std::string_view::npos) {
-        in_license_block = true;
-        i = (eol < n) ? (eol + 1) : n;
-        continue;
-      }
-      line = line.substr(end_c + 2);
-      while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) {
-        line.remove_prefix(1);
-      }
-      if (line.empty()) {
-        i = (eol < n) ? (eol + 1) : n;
-        continue;
-      }
-    }
-    const bool drop =
-        line.empty() || line.starts_with("// Copyright") ||
-        line.starts_with("// Use of this source") ||
-        line.starts_with("// found in the LICENSE") ||
-        line.starts_with("// clang-format") ||
-        line.starts_with("// eslint-disable");
-    if (!drop) {
+    if (s < e) {
       if (!out.empty()) {
-        out.push_back('\n');
+        if (is_css) {
+          const char prev = out.back();
+          const char next = cleaned[s];
+          if (prev != '{' && prev != '}' && prev != ';' && prev != ':' &&
+              prev != ',' && next != '{' && next != '}' && next != ';') {
+            out.push_back(' ');
+          }
+        } else {
+          if (out.back() != '>' || cleaned[s] != '<') {
+            out.push_back(' ');
+          }
+        }
       }
-      out.append(line);
+      bool prev_space = false;
+      for (size_t k = s; k < e; ++k) {
+        const char ch = cleaned[k];
+        if (ch == ' ' || ch == '\t') {
+          if (!prev_space) {
+            out.push_back(' ');
+            prev_space = true;
+          }
+        } else {
+          // In CSS, preserve space before ':' (descendant combinator like `a :hover`).
+          if (is_css && prev_space &&
+              (ch == '{' || ch == '}' || ch == ';' || ch == ',')) {
+            out.pop_back();
+          }
+          out.push_back(ch);
+          prev_space = false;
+          if (is_css &&
+              (ch == '{' || ch == '}' || ch == ';' || ch == ',' || ch == ':')) {
+            while (k + 1 < e &&
+                   (cleaned[k + 1] == ' ' || cleaned[k + 1] == '\t')) {
+              ++k;
+            }
+          }
+        }
+      }
     }
     i = (eol < n) ? (eol + 1) : n;
+  }
+  return out;
+}
+
+// JS-aware compactor that strips license comments and compacts multiline
+// Lit/Polymer `html\`...\`` and `css\`...\`` template literals while keeping
+// strings, regexes, and `${...}` interpolations untouched.
+void CompactJsForPakPatch(std::string& js) {
+  auto is_ident_char = [](unsigned char ch) {
+    return std::isalnum(ch) || ch == '_' || ch == '$';
+  };
+  auto is_regex_keyword = [](std::string_view kw) {
+    return kw == "return" || kw == "case" || kw == "throw" || kw == "else" ||
+           kw == "do" || kw == "in" || kw == "of" || kw == "typeof" ||
+           kw == "void" || kw == "delete" || kw == "new" || kw == "yield" ||
+           kw == "await";
+  };
+
+  std::string out;
+  out.reserve(js.size());
+  const size_t n = js.size();
+  size_t i = 0;
+  bool can_start_regex = true;
+
+  while (i < n) {
+    const char c = js[i];
+    if (c == '\'' || c == '"') {
+      const char quote = c;
+      out.push_back(js[i++]);
+      while (i < n) {
+        const char sc = js[i++];
+        out.push_back(sc);
+        if (sc == '\\' && i < n) {
+          out.push_back(js[i++]);
+        } else if (sc == quote) {
+          break;
+        }
+      }
+      can_start_regex = false;
+      continue;
+    }
+    if (c == '/' && i + 1 < n && js[i + 1] == '*') {
+      const size_t end = js.find("*/", i + 2);
+      if (end != std::string::npos) {
+        if (!out.empty() &&
+            is_ident_char(static_cast<unsigned char>(out.back()))) {
+          out.push_back(' ');
+        }
+        i = end + 2;
+        continue;
+      }
+    }
+    if (c == '/' && i + 1 < n && js[i + 1] == '/') {
+      size_t eol = js.find('\n', i);
+      if (eol == std::string::npos) {
+        eol = n;
+      }
+      const std::string_view line(js.data() + i, eol - i);
+      if ((i == 0 || js[i - 1] == '\n') &&
+          (line.starts_with("// Copyright") ||
+           line.starts_with("// Use of this source") ||
+           line.starts_with("// found in the LICENSE") ||
+           line.starts_with("// clang-format") ||
+           line.starts_with("// eslint-disable"))) {
+        i = (eol < n) ? (eol + 1) : n;
+        continue;
+      }
+      out.append(line);
+      if (eol < n) {
+        out.push_back('\n');
+      }
+      i = (eol < n) ? (eol + 1) : n;
+      continue;
+    }
+    if (c == '/' && can_start_regex) {
+      size_t r = i + 1;
+      bool in_class = false;
+      bool closed = false;
+      while (r < n && js[r] != '\n' && js[r] != '\r') {
+        const char rc = js[r++];
+        if (rc == '\\' && r < n && js[r] != '\n' && js[r] != '\r') {
+          ++r;
+        } else if (rc == '[') {
+          in_class = true;
+        } else if (rc == ']') {
+          in_class = false;
+        } else if (rc == '/' && !in_class) {
+          closed = true;
+          break;
+        }
+      }
+      if (closed) {
+        while (r < n && std::isalpha(static_cast<unsigned char>(js[r]))) {
+          ++r;
+        }
+        out.append(js.data() + i, r - i);
+        i = r;
+        can_start_regex = false;
+        continue;
+      }
+    }
+    if (c == '`') {
+      // Pre-scan this template literal's static segments to classify HTML vs CSS.
+      bool tpl_has_nl = false;
+      bool tpl_has_html = false;
+      bool tpl_has_css_brace = false;
+      bool tpl_has_css_colon = false;
+      bool tpl_has_css_semi = false;
+      size_t scan = i + 1;
+      while (scan < n) {
+        const char tc = js[scan];
+        if (tc == '\\' && scan + 1 < n) {
+          scan += 2;
+          continue;
+        }
+        if (tc == '`') {
+          break;
+        }
+        if (tc == '$' && scan + 1 < n && js[scan + 1] == '{') {
+          scan += 2;
+          int depth = 1;
+          while (scan < n && depth > 0) {
+            const char ec = js[scan++];
+            if (ec == '\'' || ec == '"' || ec == '`') {
+              const char q = ec;
+              while (scan < n) {
+                const char qch = js[scan++];
+                if (qch == '\\' && scan < n) {
+                  ++scan;
+                } else if (qch == q) {
+                  break;
+                }
+              }
+            } else if (ec == '{') {
+              ++depth;
+            } else if (ec == '}') {
+              --depth;
+            }
+          }
+          continue;
+        }
+        if (tc == '\n') tpl_has_nl = true;
+        if (tc == '<') tpl_has_html = true;
+        if (tc == '{') tpl_has_css_brace = true;
+        if (tc == ':') tpl_has_css_colon = true;
+        if (tc == ';') tpl_has_css_semi = true;
+        ++scan;
+      }
+
+      const bool compact_html = tpl_has_nl && tpl_has_html;
+      const bool compact_css = tpl_has_nl && !tpl_has_html &&
+                               tpl_has_css_brace && tpl_has_css_colon &&
+                               tpl_has_css_semi;
+
+      auto flush_seg = [&](size_t seg_start, size_t seg_end) {
+        const std::string_view seg(js.data() + seg_start, seg_end - seg_start);
+        if ((!compact_html && !compact_css) ||
+            seg.find('\n') == std::string_view::npos) {
+          out.append(seg);
+          return;
+        }
+        const bool lead_ws = !seg.empty() && (seg.front() == ' ' ||
+                                              seg.front() == '\t' ||
+                                              seg.front() == '\n' ||
+                                              seg.front() == '\r');
+        const bool trail_ws = !seg.empty() && (seg.back() == ' ' ||
+                                               seg.back() == '\t' ||
+                                               seg.back() == '\n' ||
+                                               seg.back() == '\r');
+        std::string comp = CompactTemplateSegment(seg, compact_css);
+        if (compact_html) {
+          if (lead_ws && (comp.empty() || comp.front() != '<')) {
+            out.push_back(' ');
+          }
+          out.append(comp);
+          if (trail_ws && !comp.empty() && comp.back() != '>') {
+            out.push_back(' ');
+          }
+        } else {
+          out.append(comp);
+        }
+      };
+
+      out.push_back(js[i++]);
+      size_t seg_start = i;
+      while (i < n) {
+        const char tc = js[i];
+        if (tc == '\\' && i + 1 < n) {
+          i += 2;
+          continue;
+        }
+        if (tc == '`') {
+          flush_seg(seg_start, i);
+          out.push_back(js[i++]);
+          break;
+        }
+        if (tc == '$' && i + 1 < n && js[i + 1] == '{') {
+          flush_seg(seg_start, i);
+          out.push_back('$');
+          out.push_back('{');
+          i += 2;
+          int depth = 1;
+          while (i < n && depth > 0) {
+            const char ec = js[i++];
+            out.push_back(ec);
+            if (ec == '\'' || ec == '"' || ec == '`') {
+              const char q = ec;
+              while (i < n) {
+                const char qch = js[i++];
+                out.push_back(qch);
+                if (qch == '\\' && i < n) {
+                  out.push_back(js[i++]);
+                } else if (qch == q) {
+                  break;
+                }
+              }
+            } else if (ec == '{') {
+              ++depth;
+            } else if (ec == '}') {
+              --depth;
+            }
+          }
+          seg_start = i;
+          continue;
+        }
+        ++i;
+      }
+      can_start_regex = false;
+      continue;
+    }
+    if (is_ident_char(static_cast<unsigned char>(c))) {
+      const size_t start = i;
+      while (i < n && is_ident_char(static_cast<unsigned char>(js[i]))) {
+        out.push_back(js[i++]);
+      }
+      can_start_regex =
+          is_regex_keyword(std::string_view(js.data() + start, i - start));
+      continue;
+    }
+    if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+      can_start_regex = (c != ')' && c != ']');
+    }
+    out.push_back(js[i++]);
   }
   js = std::move(out);
 }
 
-// Injects a lightweight `#cp_sync=<base64url_json>` handler into
-// `chrome://bookmarks`'s JS bundle so Chrome++ popup edits (delete/edit/add/
-// drag-reorder) synchronize immediately into Chrome's live in-memory
-// BookmarkModel, built-in BookmarkBarView, and Google Account Sync.
+// Prepends a lightweight `#cp=<base64url_json>` handler to `chrome://bookmarks`'s
+// JS bundle so Chrome++ popup edits (delete/edit/add/drag-reorder) execute
+// BEFORE `<bookmarks-app>` upgrades or `bookmarks-router` rewrites the URL,
+// synchronizing immediately into Chrome's live BookmarkModel and native bar.
 bool PatchBookmarksJs(uint8_t* begin, uint32_t size, size_t& new_len) {
   const std::span<uint8_t> buf(begin, size);
-  constexpr char kNeedle1[] = "chrome.bookmarks.getTree";
-  if (SearchMemory(
-          buf, std::span<const uint8_t>(
-                   reinterpret_cast<const uint8_t*>(kNeedle1),
-                   sizeof(kNeedle1) - 1))
-          .empty()) {
+  auto has_str = [&](std::string_view needle) {
+    return !SearchMemory(
+                buf, std::span<const uint8_t>(
+                         reinterpret_cast<const uint8_t*>(needle.data()),
+                         needle.size()))
+                .empty();
+  };
+
+  const bool has_bookmarks_api = has_str("chrome.bookmarks");
+  if (!has_bookmarks_api) {
     return false;
   }
-  constexpr char kNeedle2[] = "bookmarks-app";
-  constexpr char kNeedle3[] = "chrome.bookmarkManagerPrivate";
-  const bool has_app =
-      !SearchMemory(
-           buf, std::span<const uint8_t>(
-                    reinterpret_cast<const uint8_t*>(kNeedle2),
-                    sizeof(kNeedle2) - 1))
-           .empty();
-  const bool has_private =
-      !SearchMemory(
-           buf, std::span<const uint8_t>(
-                    reinterpret_cast<const uint8_t*>(kNeedle3),
-                    sizeof(kNeedle3) - 1))
-           .empty();
-  if (!has_app && !has_private) {
+  const bool has_app = has_str("bookmarks-app");
+  const bool has_private = has_str("chrome.bookmarkManagerPrivate");
+  const bool has_get_tree = has_str("chrome.bookmarks.getTree");
+  if (!has_app && !(has_private && has_get_tree)) {
     return false;
   }
+
+  g_bm_cand_hits.fetch_add(1, std::memory_order_relaxed);
+  g_bm_cand_orig.store(size, std::memory_order_relaxed);
 
   std::string js(reinterpret_cast<char*>(begin), size);
+  if (js.size() >= 3 && static_cast<unsigned char>(js[0]) == 0xEF &&
+      static_cast<unsigned char>(js[1]) == 0xBB &&
+      static_cast<unsigned char>(js[2]) == 0xBF) {
+    js.erase(0, 3);
+  }
   CompactJsForPakPatch(js);
+  g_bm_cand_compacted.store(static_cast<uint32_t>(js.size()),
+                            std::memory_order_relaxed);
 
-  // Executed only when opened with `#cp_sync=<base64url>` by Chrome++.
-  // Normal `chrome://bookmarks/` visits return immediately on line 1.
+  // Valid ES module syntax even before hoisted `import` declarations; runs
+  // before `customElements.define('bookmarks-app', ...)` so `location.hash`
+  // is captured before `bookmarks-router` can call `history.replaceState`.
   static constexpr std::string_view kSyncSnippet =
-      "\n;(async()=>{let h=location.hash;if(!h.startsWith(\"#cp_sync=\"))return;"
+      "if(location.hash.startsWith(\"#cp=\"))(async()=>{"
       "document.documentElement.style.display=\"none\";"
-      "let a=\"\",ok=0,M={},C=[],B=chrome.bookmarks,"
-      "P=(f,...x)=>new Promise(r=>{try{f.call(B,...x,v=>{void chrome.runtime?.lastError;r(v)})}catch{r()}}),"
-      "fl=(n,o=[])=>{for(let e of n||[]){o.push(e);if(e.children)fl(e.children,o)}return o},"
-      "fr=(r,b,s)=>{let t=b?\"bookmarks-bar\":\"other\",x=r.filter(e=>e.folderType==t);"
-      "return x.length?x.find(e=>!!e.syncing==s)||x[0]:r.find(e=>e.id==(b?\"1\":\"2\"))||r[b?0:1]||r[0]},"
-      "fn=(A,i,t,u,F,s)=>{let m=M[i]||i,e=m&&A.find(x=>x.id==m);"
-      "if(e&&(F===void 0||!!e.children==!!F)&&(M[i]||(F?!t||e.title==t:(!u||e.url==u)&&(!t||e.title==t))))return e;"
-      "let c=A.filter(x=>x.parentId&&x.parentId!=\"0\"&&(F===true?x.children&&x.title==t:F===false?!x.children&&u&&x.url==u:u?!x.children&&x.url==u:t&&x.title==t));"
-      "return c.length?c.find(x=>x.title==t&&!!x.syncing==s)||c.find(x=>x.title==t)||c.find(x=>!!x.syncing==s)||c[0]:e&&(F===void 0||!!e.children==!!F)&&(!u||e.url==u)?e:null},"
-      "fd=(r,A,i,t,s)=>i==\"__bookmark_bar__\"?fr(r,1,s):i==\"__other__\"?fr(r,0,s):fn(A,i,t,\"\",true,s);"
-      "try{let s=h.slice(9).replace(/-/g,\"+\").replace(/_/g,\"/\"),"
-      "b=atob(s+\"=\".repeat((4-s.length%4)%4)),"
-      "p=JSON.parse(new TextDecoder().decode(Uint8Array.from(b,c=>c.charCodeAt(0))));"
-      "a=p.ack||\"\";"
-      "for(let o of p.ops||[]){let T=await P(B.getTree);if(!T?.[0])break;"
-      "let r=T[0].children||[],A=fl(r),w=o.ds==\"a\",q=o.ss==\"a\";"
-      "if(o.k==\"d\"){let n=fn(A,o.id,o.ot,o.ou,o.f,q);if(n){await P(n.children?B.removeTree:B.remove,n.id);ok++}}"
-      "else if(o.k==\"u\"){let n=fn(A,o.id,o.ot,o.ou,o.f,q);if(n){let c={title:o.t};if(o.hu&&!n.children)c.url=o.u;await P(B.update,n.id,c);ok++}}"
-      "else if(o.k==\"a\"||o.k==\"m\"){let d=fd(r,A,o.df,o.dt,w),n=o.k==\"m\"?fn(A,o.id,o.ot,o.ou,o.f,q):1;"
-      "if(n&&d&&n.id!=d.id){let K=d.children||[],g=(o.ai||o.at||o.au)&&fn(K,o.ai,o.at,o.au,void 0,w),"
-      "x=g&&g.id!=n.id?K.indexOf(g):-1,idx=x>=0?(o.ia?x+1:x):-1;"
-      "if(o.k==\"a\"){let q={parentId:d.id,title:o.t};if(!o.f)q.url=o.u;if(idx>=0&&idx<=K.length)q.index=idx;"
-      "let v=await P(B.create,q);if(v?.id){M[o.id]=v.id;C.push(o.id+\":\"+v.id);ok++}}"
-      "else{let q={parentId:d.id};if(idx>=0)q.index=idx;await P(B.move,n.id,q);ok++}}}}"
-      "}catch{}"
-      "if(/^http:\\/\\/127\\.0\\.0\\.1:\\d+\\/api\\/bm-ack\\?/.test(a))"
+      "let h=location.hash,a=\"\",ok=0,M={},C=[],B=chrome.bookmarks,"
+      "P=(f,...x)=>new Promise(r=>{try{let q=f.call(B,...x,v=>{chrome.runtime?.lastError;r(v)});"
+      "q?.then&&q.then(r,()=>r())}catch{r()}}),"
+      "fl=(n,o=[])=>{for(let e of n||[])o.push(e),e.children&&fl(e.children,o);return o},"
+      "fr=(r,b,s)=>{let x=r.filter(e=>e.folderType==(b?\"bookmarks-bar\":\"other\"));"
+      "return x.find(e=>!!e.syncing==s)||x[0]||r.find(e=>e.id==(b?\"1\":\"2\"))||r[b?0:1]||r[0]},"
+      "fn=(A,i,t,u,F,s)=>{let m=M[i]||i,e=m&&A.find(x=>x.id==m),K=x=>F==null||!!x.children==!!F;"
+      "if(e&&K(e)&&(M[i]||(F?!t||e.title==t:(!u||e.url==u)&&(!t||e.title==t))))return e;"
+      "let c=A.filter(x=>x.parentId&&x.parentId!=\"0\"&&K(x)&&(F?x.title==t:u?x.url==u:t&&x.title==t));"
+      "return c.find(x=>x.title==t&&!!x.syncing==s)||c.find(x=>x.title==t)||"
+      "c.find(x=>!!x.syncing==s)||c[0]||(e&&K(e)&&(!u||e.url==u)?e:null)};"
+      "try{let p=JSON.parse(decodeURIComponent(escape(atob(h.slice(4).replace(/-/g,\"+\").replace(/_/g,\"/\")))));"
+      "a=p.a||\"\";"
+      "for(let o of p.o||[]){let T=await P(B.getTree);if(!T?.[0])break;"
+      "let r=T[0].children||[],A=fl(r),w=o.ds==\"a\",q=o.ss==\"a\",k=o.k;"
+      "if(k==\"d\"){let n=fn(A,o.id,o.ot,o.ou,o.f,q);if(n)await P(n.children?B.removeTree:B.remove,n.id),ok++}"
+      "else if(k==\"u\"){let n=fn(A,o.id,o.ot,o.ou,o.f,q);if(n)await P(B.update,n.id,o.hu&&!n.children?{title:o.t,url:o.u}:{title:o.t}),ok++}"
+      "else{let d=o.df==\"__bookmark_bar__\"?fr(r,1,w):o.df==\"__other__\"?fr(r,0,w):fn(A,o.df,o.dt,\"\",!0,w),"
+      "n=k==\"m\"?fn(A,o.id,o.ot,o.ou,o.f,q):1;"
+      "if(n&&d&&n.id!=d.id){let L=d.children||[],g=(o.ai||o.at||o.au)&&fn(L,o.ai,o.at,o.au,null,w),"
+      "x=g&&g.id!=n.id?L.indexOf(g):-1,idx=x>=0?(o.ia?x+1:x):-1;"
+      "if(k==\"a\"){let z={parentId:d.id,title:o.t};if(!o.f)z.url=o.u;if(idx>=0&&idx<=L.length)z.index=idx;"
+      "let v=await P(B.create,z);if(v?.id)M[o.id]=v.id,C.push(o.id+\":\"+v.id),ok++}"
+      "else if(k==\"m\"){let z={parentId:d.id};if(idx>=0)z.index=idx;await P(B.move,n.id,z),ok++}}}}}catch{}"
+      "if(a.startsWith(\"http://127.0.0.1:\"))"
       "location.replace(a+\"&ok=\"+ok+(C.length?\"&map=\"+encodeURIComponent(C.join(\",\")):\"\"));"
       "else window.close()})();\n";
 
-  js.append(kSyncSnippet);
-  if (js.length() > size) {
+  std::string patched;
+  patched.reserve(kSyncSnippet.size() + js.size());
+  patched.append(kSyncSnippet);
+  patched.append(js);
+  g_bm_cand_new.store(static_cast<uint32_t>(patched.size()),
+                      std::memory_order_relaxed);
+  if (patched.length() > size) {
     return false;
   }
-  memcpy(begin, js.c_str(), js.length());
-  new_len = js.length();
+  memcpy(begin, patched.c_str(), patched.length());
+  new_len = patched.length();
   return true;
 }
 
@@ -454,8 +731,8 @@ constexpr PakPatchTarget kBookmarksTarget{
     .blob_env = L"CHROME_PLUS_PAK_BM_BLOB",
     .section_prefix = L"Local\\ChromePlusPakBmBlob_",
     .cache_name = L"Chrome++_PakCache_Bm.bin",
-    .build_tag = RELEASE_VER_STR BUILD_ARCH "-bm-sync-v2",
-    .min_entry_size = 10 * 1024,
+    .build_tag = RELEASE_VER_STR BUILD_ARCH "-bm-sync-v3",
+    .min_entry_size = 2 * 1024,
     .patch_fn = PatchBookmarksJs,
 };
 
@@ -539,14 +816,19 @@ std::optional<uint16_t> ApplyCachedResult(uint8_t* buffer,
       HashEntry(entry) != header.entry_hash) {
     return std::nullopt;
   }
+  const bool build_matches =
+      header.build_hash == HashBuildTag(target.build_tag);
   if (header.resource_id == 0) {
+    if (!build_matches) {
+      return std::nullopt;
+    }
     DebugLog(L"PakPatch: cached result: no target");
     return 0;
   }
   if (hint_id) {
     *hint_id = header.resource_id;
   }
-  if (skip_bytes || header.build_hash != HashBuildTag(target.build_tag)) {
+  if (skip_bytes || !build_matches) {
     return std::nullopt;
   }
   const std::optional<PakResourceSlot> slot =
@@ -632,6 +914,9 @@ __declspec(noinline) uint16_t PatchOneTarget(uint8_t* buffer,
   uint16_t matched_id = 0;
   if (cached_id) {
     matched_id = *cached_id;
+    if (slot_index == 1) {
+      g_bm_from_cache.store(true, std::memory_order_relaxed);
+    }
   } else {
     const uint16_t target_id =
         cached_hint_id != 0 ? cached_hint_id : GetPakTargetId(target.id_env);
@@ -670,8 +955,40 @@ uint16_t SafePatchBookmarksTarget(uint8_t* buffer, uint16_t skip_id) {
 void PatchResourcesPak(uint8_t* buffer) {
   const uint16_t settings_id = PatchOneTarget(buffer, kSettingsTarget, 0, 0);
   const uint16_t bm_id = SafePatchBookmarksTarget(buffer, settings_id);
-  if (IsBrowserProcess() && bm_id != 0) {
-    g_bookmarks_pak_patched.store(true, std::memory_order_relaxed);
+  if (IsBrowserProcess()) {
+    std::string diag;
+    if (bm_id != 0) {
+      g_bookmarks_pak_patched.store(true, std::memory_order_relaxed);
+      if (g_bm_from_cache.load(std::memory_order_relaxed)) {
+        diag = "ok(cached id=" + std::to_string(bm_id) + ")";
+      } else {
+        diag = "ok(id=" + std::to_string(bm_id) + ", orig=" +
+               std::to_string(g_bm_cand_orig.load(std::memory_order_relaxed)) +
+               ", comp=" +
+               std::to_string(
+                   g_bm_cand_compacted.load(std::memory_order_relaxed)) +
+               ", new=" +
+               std::to_string(g_bm_cand_new.load(std::memory_order_relaxed)) +
+               ")";
+      }
+    } else if (g_bm_cand_hits.load(std::memory_order_relaxed) > 0) {
+      diag = "no_fit(hits=" +
+             std::to_string(g_bm_cand_hits.load(std::memory_order_relaxed)) +
+             ", orig=" +
+             std::to_string(g_bm_cand_orig.load(std::memory_order_relaxed)) +
+             ", comp=" +
+             std::to_string(
+                 g_bm_cand_compacted.load(std::memory_order_relaxed)) +
+             ", new=" +
+             std::to_string(g_bm_cand_new.load(std::memory_order_relaxed)) +
+             ")";
+    } else if (g_bm_from_cache.load(std::memory_order_relaxed)) {
+      diag = "cached_none";
+    } else {
+      diag = "not_found";
+    }
+    std::lock_guard lock(g_bm_diag_mutex);
+    g_bm_pak_diag = std::move(diag);
   }
 }
 
@@ -785,4 +1102,9 @@ void PakPatch() {
 
 bool IsBookmarksPakPatched() {
   return g_bookmarks_pak_patched.load(std::memory_order_relaxed);
+}
+
+std::string GetBookmarksPakDiagnostic() {
+  std::lock_guard lock(g_bm_diag_mutex);
+  return g_bm_pak_diag;
 }
